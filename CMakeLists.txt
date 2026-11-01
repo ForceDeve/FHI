@@ -12,6 +12,10 @@ pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
 # VTE's GTK4 build is a separate package (libvte-2.91-gtk4-dev); plain "vte" is the old GTK2 one
 pkg_check_modules(VTE REQUIRED IMPORTED_TARGET vte-2.91-gtk4)
 
+# Put the finished program in the project folder, next to the sources, as "FHI"
+# (instead of inside the cmake-build-* folder)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 add_executable(FHI main.c preview.c)
 target_link_libraries(FHI PRIVATE PkgConfig::GTK4 PkgConfig::VTE)
 
