@@ -59,3 +59,63 @@ __fhi_report_cwd() {
 # has finished. That's exactly "check every time a command is entered", and it
 # also catches `cd` inside aliases and functions.
 add-zsh-hook precmd __fhi_report_cwd
+
+# ---------------------------------------------------------------------------
+# Live command line for the file preview
+#
+# While the user types, the C program wants to know the text of the command
+# line, so it can highlight the files the command would touch. Terminals have
+# no standard way to send that, so we borrow one that VTE reliably reports:
+# the window TITLE (escape sequence ESC ] 2 ; text BEL). VTE emits
+# "window-title-changed" and the C program ignores every title that does not
+# start with "FHI-BUF:".
+#
+# zsh runs "zle hooks" at set moments while you edit the line:
+#   line-pre-redraw  - before the line is redrawn, i.e. after EVERY keystroke
+#   line-finish      - when you press Enter (the line is accepted)
+# $BUFFER holds the text of the line being edited.
+# ---------------------------------------------------------------------------
+autoload -Uz add-zle-hook-widget
+
+typeset -g __fhi_last_buffer=""
+
+# Send $1 as the new command line text. Control characters and "%" are
+# percent-encoded (a newline becomes %0A) so they cannot break the escape
+# sequence; the C program decodes them again.
+__fhi_send_buffer() {
+  setopt localoptions extendedglob
+  local encoded=${1//(#m)[%[:cntrl:]]/%${(l:2::0:)$(( [##16] #MATCH ))}}
+  print -rn -- $'\e]2;FHI-BUF:'"$encoded"$'\a'
+}
+
+__fhi_buffer_changed() {
+  # only talk to the terminal when the text really changed
+  [[ "$BUFFER" == "$__fhi_last_buffer" ]] && return
+  __fhi_last_buffer="$BUFFER"
+  __fhi_send_buffer "$BUFFER"
+}
+
+__fhi_buffer_finished() {
+  # Enter was pressed: the command runs now, so clear the preview
+  __fhi_last_buffer=""
+  __fhi_send_buffer ""
+}
+
+add-zle-hook-widget line-pre-redraw __fhi_buffer_changed
+add-zle-hook-widget line-finish __fhi_buffer_finished
+
+# ---------------------------------------------------------------------------
+# "A command has finished" signal
+#
+# precmd runs right before every prompt, so it runs after each command ends.
+# We send a title "FHI-PROMPT:<counter>". The counter makes every title
+# different: VTE only reports a title when it CHANGED. The C program then checks
+# that its file list still matches the folder (see resync_directory in main.c).
+# ---------------------------------------------------------------------------
+typeset -gi __fhi_prompt_count=0
+
+__fhi_prompt_ready() {
+  print -rn -- $'\e]2;FHI-PROMPT:'"$(( ++__fhi_prompt_count ))"$'\a'
+}
+
+add-zsh-hook precmd __fhi_prompt_ready
