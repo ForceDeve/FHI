@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=FHI Terminal
+Comment=Terminal with a file list that previews what your command will do
+Exec=FHI
+Icon=fhi
+Terminal=false
+Categories=System;TerminalEmulator;Utility;
+StartupWMClass=dev.forcedev.myterm

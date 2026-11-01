@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <glib/gstdio.h>
 #include "preview.h"
+#include <strings.h>
 
 /* Indexes into Settings.col */
 enum { C_TOUCH, C_CREATE, C_DEST, C_REMOVE, C_TERM_BG, C_TERM_FG, C_COUNT };
@@ -19,6 +20,15 @@ static const char *const color_label[C_COUNT] = {
 	"Terminal background", "Terminal text"
 };
 
+/* Sort modes. For size / dates the "normal" direction is largest / newest first. */
+enum { SORT_NAME, SORT_SIZE, SORT_MODIFIED, SORT_CREATED, SORT_TYPE, SORT_COUNT };
+static const char *const sort_name[SORT_COUNT] = { "Name", "Size", "Modified", "Created", "Type" };
+static const char *const sort_dir_text[SORT_COUNT][2] = {
+	{ "A to Z", "Z to A" }, { "largest first", "smallest first" },
+	{ "newest first", "oldest first" }, { "newest first", "oldest first" },
+	{ "A to Z", "Z to A" },
+};
+
 /* Everything the hamburger menu can change. Saved in ~/.config/fhi/settings.ini */
 typedef struct {
 	int scheme;                 /* 0 = follow system, 1 = light, 2 = dark */
@@ -28,6 +38,9 @@ typedef struct {
 	gboolean info_type, info_size, info_created, info_accessed;
 	gboolean info_wrap;         /* wrap the info bar instead of cutting it off */
 	int info_font;              /* font size of the info bar, in points */
+	int sort_mode;              /* SORT_* */
+	gboolean sort_reverse;
+	gboolean folders_first;
 } Settings;
 
 /*
@@ -66,6 +79,15 @@ typedef struct {
 	GtkWidget *scheme_dd;            /* theme page widgets, kept so "Reset" can update them */
 	GtkWidget *color_btn[C_COUNT];
 	GtkWidget *term_switch;
+
+	/* --- sorting and filtering --- */
+	GtkSorter *sorter;
+	FhiFilter *filter;               /* from the filter box, NULL = show everything */
+	GtkWidget *filter_entry;
+	GtkWidget *filter_bar;           /* holds filter_entry; hidden until you type */
+	GtkWidget *sort_label;           /* faint "Size ↓" text, only shown when not the default sort */
+	GtkWidget *sort_dd;              /* sorting page widgets, so the keyboard can drive them */
+	GtkWidget *reverse_switch;
 } State;
 
 static void
@@ -162,13 +184,56 @@ unbind_item(GtkSignalListItemFactory *factory, GtkListItem *item, gpointer user_
 	g_hash_table_remove(st->bound_rows, gtk_list_item_get_child(item));
 }
 
-static int
-compare_info(gconstpointer a, gconstpointer b, gpointer user_data)
+/* The part of the name after the last dot ("" if none; a leading dot is no extension) */
+static const char *
+extension_of(const char *name)
 {
-	return g_utf8_collate(g_file_info_get_display_name(G_FILE_INFO((gpointer)a)),
-	                      g_file_info_get_display_name(G_FILE_INFO((gpointer)b)));
+	const char *dot = strrchr(name, '.');
+	return (dot && dot != name) ? dot + 1 : "";
 }
 
+static int
+cmp_u64(guint64 a, guint64 b)
+{
+	return a < b ? -1 : a > b;
+}
+
+static int
+compare_info(gconstpointer pa, gconstpointer pb, gpointer user_data)
+{
+	State *st = user_data;
+	const Settings *c = &st->cfg;
+	GFileInfo *a = G_FILE_INFO((gpointer)pa), *b = G_FILE_INFO((gpointer)pb);
+
+	if (c->folders_first) {
+		gboolean da = g_file_info_get_file_type(a) == G_FILE_TYPE_DIRECTORY;
+		gboolean db = g_file_info_get_file_type(b) == G_FILE_TYPE_DIRECTORY;
+		if (da != db) return da ? -1 : 1;   /* not flipped by "reverse" */
+	}
+
+	int r = 0;
+	switch (c->sort_mode) {
+	case SORT_SIZE:     /* biggest first */
+		r = -cmp_u64(g_file_info_get_size(a), g_file_info_get_size(b));
+		break;
+	case SORT_MODIFIED: /* newest first */
+		r = -cmp_u64(g_file_info_get_attribute_uint64(a, "time::modified"),
+		             g_file_info_get_attribute_uint64(b, "time::modified"));
+		break;
+	case SORT_CREATED:
+		r = -cmp_u64(g_file_info_get_attribute_uint64(a, "time::created"),
+		             g_file_info_get_attribute_uint64(b, "time::created"));
+		break;
+	case SORT_TYPE:
+		r = strcasecmp(extension_of(g_file_info_get_name(a)), extension_of(g_file_info_get_name(b)));
+		break;
+	default:
+		break;
+	}
+	if (r == 0)   /* same size / date / type: fall back to the name */
+		r = g_utf8_collate(g_file_info_get_display_name(a), g_file_info_get_display_name(b));
+	return c->sort_reverse ? -r : r;
+}
 
 /* A row for a file that does not exist yet but the typed command would create. */
 static GFileInfo *
@@ -483,6 +548,10 @@ paste_selected_path(State *st)
 }
 
 static void menu_set_open(State *st, gboolean open);
+static void sort_cycle(State *st, int step);
+static void sort_toggle_reverse(State *st);
+static void filter_begin(State *st, const char *chars);
+static void filter_end(State *st, gboolean clear);
 
 /*
  * Keyboard shortcuts for the whole window. Connected in activate() to a
@@ -521,6 +590,45 @@ on_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode,
 		return TRUE;
 	}
 
+	GtkWidget *cur = gtk_window_get_focus(GTK_WINDOW(st->window));
+	gboolean in_list = cur && (cur == st->list_view || gtk_widget_is_ancestor(cur, st->list_view));
+	gboolean in_filter = cur && (cur == st->filter_entry || gtk_widget_is_ancestor(cur, st->filter_entry));
+
+	/* Esc in the filter box, or in the list while a filter is showing: clear it and hide the box */
+	if (modifiers == 0 && keyval == GDK_KEY_Escape &&
+	    (in_filter || (in_list && gtk_widget_get_visible(st->filter_bar)))) {
+		filter_end(st, TRUE);
+		return TRUE;
+	}
+	/* Backspace in the file list = "cd ..". While a filter is showing it edits the
+	 * filter instead, like any other typing in the list. */
+	if (in_list && keyval == GDK_KEY_BackSpace && modifiers == 0) {
+		if (gtk_widget_get_visible(st->filter_bar)) {
+			filter_begin(st, NULL);
+			GtkEditable *e = GTK_EDITABLE(st->filter_entry);
+			glong len = g_utf8_strlen(gtk_editable_get_text(e), -1);
+			if (len > 0) gtk_editable_delete_text(e, len - 1, -1);
+		} else if (shell_is_foreground(st)) {
+			type_into_terminal(st, "cd -- ..\r");
+		}
+		return TRUE;
+	}
+	if (in_list && keyval == GDK_KEY_r && modifiers == GDK_CONTROL_MASK) {
+		sort_toggle_reverse(st);
+		return TRUE;
+	}
+	/* Typing a letter, digit or symbol in the file list starts the filter. (Shift is
+	 * allowed for capitals and for symbols like "?" and "{".) Space is left alone. */
+	if (in_list && (modifiers == 0 || modifiers == GDK_SHIFT_MASK)) {
+		gunichar ch = gdk_keyval_to_unicode(keyval);
+		if (ch != 0 && ch != ' ' && g_unichar_isprint(ch)) {
+			char utf8[8] = { 0 };
+			g_unichar_to_utf8(ch, utf8);
+			filter_begin(st, utf8);
+			return TRUE;
+		}
+	}
+
 	/* The rest are Shift+key shortcuts */
 	if (modifiers != GDK_SHIFT_MASK) return FALSE;
 
@@ -530,6 +638,11 @@ on_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode,
 		return TRUE;
 	case GDK_KEY_Right: /* Shift+Right: go to the terminal */
 		gtk_widget_grab_focus(st->terminal);
+		return TRUE;
+	case GDK_KEY_Up:    /* Shift+Up / Down: change the sort mode, only in the file list */
+	case GDK_KEY_Down:
+		if (!in_list) return FALSE;
+		sort_cycle(st, keyval == GDK_KEY_Up ? +1 : -1);
 		return TRUE;
 	case GDK_KEY_Return:
 	case GDK_KEY_KP_Enter: {
@@ -562,6 +675,9 @@ settings_defaults(Settings *c)
 	c->info_type = c->info_size = c->info_created = c->info_accessed = TRUE;
 	c->info_wrap = FALSE;
 	c->info_font = 9;
+	c->sort_mode = SORT_NAME;
+	c->sort_reverse = FALSE;
+	c->folders_first = TRUE;
 }
 
 static char *
@@ -600,6 +716,10 @@ load_settings(State *st)
 		kf_get_bool(kf, "info_created", &c->info_created);
 		kf_get_bool(kf, "info_accessed", &c->info_accessed);
 		kf_get_bool(kf, "info_wrap", &c->info_wrap);
+		kf_get_bool(kf, "sort_reverse", &c->sort_reverse);
+		kf_get_bool(kf, "folders_first", &c->folders_first);
+		if (g_key_file_has_key(kf, "fhi", "sort_mode", NULL))
+			c->sort_mode = CLAMP(g_key_file_get_integer(kf, "fhi", "sort_mode", NULL), 0, SORT_COUNT - 1);
 	}
 	g_free(path);
 	g_key_file_unref(kf);
@@ -624,6 +744,9 @@ save_settings(State *st)
 	g_key_file_set_boolean(kf, "fhi", "info_created", c->info_created);
 	g_key_file_set_boolean(kf, "fhi", "info_accessed", c->info_accessed);
 	g_key_file_set_boolean(kf, "fhi", "info_wrap", c->info_wrap);
+	g_key_file_set_boolean(kf, "fhi", "sort_reverse", c->sort_reverse);
+	g_key_file_set_boolean(kf, "fhi", "folders_first", c->folders_first);
+	g_key_file_set_integer(kf, "fhi", "sort_mode", c->sort_mode);
 
 	char *path = settings_path();
 	char *dir = g_path_get_dirname(path);
@@ -806,9 +929,10 @@ static gboolean
 hidden_filter_func(gpointer item, gpointer user_data)
 {
 	State *st = user_data;
-	if (st->cfg.show_hidden) return TRUE;
 	const char *name = g_file_info_get_name(G_FILE_INFO(item));
-	return name == NULL || name[0] != '.';
+	if (name == NULL) return TRUE;
+	if (!st->cfg.show_hidden && name[0] == '.') return FALSE;
+	return fhi_filter_matches(st->filter, name);
 }
 
 /* ---- applying settings -------------------------------------------------- */
@@ -848,6 +972,8 @@ apply_all(State *st, gboolean save)
 	    ".fhi-menu   { background-color: @theme_bg_color; padding: 8px 10px;"
 	    "              border-right: 1px solid alpha(currentColor, 0.25);"
 	    "              box-shadow: 4px 0 14px alpha(black, 0.35); }"
+	    ".fhi-top    { padding: 4px; }"
+	    ".fhi-sort   { font-size: 8pt; opacity: 0.5; padding: 4px 8px; }"
 	    ".fhi-swatch { min-width: 14px; min-height: 14px; border-radius: 3px; }",
 	    col[0], col[1], col[2], col[3], c->info_font);
 	gtk_css_provider_load_from_data(st->css, css, -1);
@@ -864,6 +990,20 @@ apply_all(State *st, gboolean save)
 	}
 
 	gtk_filter_changed(st->hidden_filter, GTK_FILTER_CHANGE_DIFFERENT);
+	if (st->sorter) gtk_sorter_changed(st->sorter, GTK_SORTER_CHANGE_DIFFERENT);
+	if (st->sort_label) {
+		/* Faint hint, and only when the sort is not the plain default */
+		gboolean plain = c->sort_mode == SORT_NAME && !c->sort_reverse;
+		char *text = g_strdup_printf("%s %s", sort_name[c->sort_mode], c->sort_reverse ? "↑" : "↓");
+		char *tip = g_strdup_printf("Sorted by %s, %s%s\nShift+↑/↓ changes the mode, Ctrl+R reverses",
+		    sort_name[c->sort_mode], sort_dir_text[c->sort_mode][c->sort_reverse],
+		    c->folders_first ? ", folders first" : "");
+		gtk_label_set_text(GTK_LABEL(st->sort_label), text);
+		gtk_widget_set_tooltip_text(st->sort_label, tip);
+		gtk_widget_set_visible(st->sort_label, !plain);
+		g_free(text);
+		g_free(tip);
+	}
 	update_info(st);
 	if (save) save_settings(st);
 }
@@ -1066,14 +1206,22 @@ build_cheat_page(State *st, GtkWidget *stack)
 	gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
 	gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
 
-	cheat_row(grid, 0, "Shift + ←", "Move to the file list");
-	cheat_row(grid, 1, "Shift + →", "Move to the terminal");
-	cheat_row(grid, 2, "↑  ↓", "Move through the files (file list)");
-	cheat_row(grid, 3, "Enter", "Open the file, or cd into the folder (file list)");
-	cheat_row(grid, 4, "Shift + Enter", "Type the file's path onto the command line (file list)");
-	cheat_row(grid, 5, "Double click", "Same as Enter");
-	cheat_row(grid, 6, "Tab", "Open this menu (file list)");
-	cheat_row(grid, 7, "Esc", "Close this menu");
+	static const char *const cheats[][2] = {
+		{ "Shift + ←", "Move to the file list" },
+		{ "Shift + →", "Move to the terminal" },
+		{ "↑  ↓", "Move through the files (file list)" },
+		{ "Enter", "Open the file, or cd into the folder (file list)" },
+		{ "Backspace", "Go up one folder (cd ..) (file list)" },
+		{ "Shift + Enter", "Type the file's path onto the command line (file list)" },
+		{ "Double click", "Same as Enter" },
+		{ "Shift + ↑ / ↓", "Next / previous sort mode (file list)" },
+		{ "Ctrl + R", "Reverse the sort order (file list)" },
+		{ "Just type", "Filter the list with shell patterns: *.png  {a,b}*  !*.o  (file list)" },
+		{ "Enter / Esc", "In the filter: keep it and go back to the list / clear it and close it" },
+		{ "Tab", "Open this menu (file list)" },
+		{ "Esc", "Close this menu" },
+	};
+	for (guint i = 0; i < G_N_ELEMENTS(cheats); i++) cheat_row(grid, i, cheats[i][0], cheats[i][1]);
 	gtk_box_append(GTK_BOX(page), grid);
 
 	GtkWidget *hl = gtk_label_new("Highlight colors while typing");
@@ -1131,6 +1279,113 @@ build_info_page(State *st, GtkWidget *stack)
 	gtk_box_append(GTK_BOX(row), spin);
 	gtk_box_append(GTK_BOX(page), row);
 	return page;
+}
+
+static void
+on_sort_changed(GObject *dd, GParamSpec *pspec, gpointer user_data)
+{
+	State *st = user_data;
+	st->cfg.sort_mode = gtk_drop_down_get_selected(GTK_DROP_DOWN(dd));
+	apply_all(st, TRUE);
+}
+
+/* Keyboard / button: go to the next (+1) or previous (-1) sort mode */
+static void
+sort_cycle(State *st, int step)
+{
+	int mode = (st->cfg.sort_mode + step + SORT_COUNT) % SORT_COUNT;
+	gtk_drop_down_set_selected(GTK_DROP_DOWN(st->sort_dd), mode);   /* fires on_sort_changed */
+}
+
+static void
+sort_toggle_reverse(State *st)
+{
+	gtk_switch_set_active(GTK_SWITCH(st->reverse_switch), !st->cfg.sort_reverse);
+}
+
+static GtkWidget *
+build_sort_page(State *st, GtkWidget *stack)
+{
+	GtkWidget *page = sub_page(stack, "Sorting");
+
+	GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+	GtkWidget *label = gtk_label_new("Sort by");
+	st->sort_dd = gtk_drop_down_new_from_strings(sort_name);
+	gtk_drop_down_set_selected(GTK_DROP_DOWN(st->sort_dd), st->cfg.sort_mode);
+	gtk_label_set_xalign(GTK_LABEL(label), 0);
+	gtk_widget_set_hexpand(label, TRUE);
+	g_signal_connect(st->sort_dd, "notify::selected", G_CALLBACK(on_sort_changed), st);
+	gtk_box_append(GTK_BOX(row), label);
+	gtk_box_append(GTK_BOX(row), st->sort_dd);
+	gtk_box_append(GTK_BOX(page), row);
+
+	GtkWidget *rev = switch_row(st, "Reverse order", &st->cfg.sort_reverse);
+	st->reverse_switch = gtk_widget_get_last_child(rev);
+	gtk_box_append(GTK_BOX(page), rev);
+	gtk_box_append(GTK_BOX(page), switch_row(st, "Folders first", &st->cfg.folders_first));
+
+	GtkWidget *hint = gtk_label_new("Size and dates start with the largest / newest.\n"
+	                                "In the file list: Shift+↑ / Shift+↓ change the mode, Ctrl+R reverses.");
+	gtk_label_set_xalign(GTK_LABEL(hint), 0);
+	gtk_label_set_wrap(GTK_LABEL(hint), TRUE);
+	gtk_label_set_max_width_chars(GTK_LABEL(hint), 34);
+	gtk_widget_add_css_class(hint, "dim-label");
+	gtk_box_append(GTK_BOX(page), hint);
+	return page;
+}
+
+/* The filter box changed: rebuild the filter from what was typed */
+static void
+on_filter_changed(GtkEditable *entry, gpointer user_data)
+{
+	State *st = user_data;
+	fhi_filter_free(st->filter);
+	const char *text = gtk_editable_get_text(entry);
+	st->filter = *text ? fhi_filter_new(text) : NULL;
+	gtk_filter_changed(st->hidden_filter, GTK_FILTER_CHANGE_DIFFERENT);
+	update_info(st);
+
+	/* Nothing left to filter by (backspaced to empty, or cleared): hide the box.
+	 * Only move focus if the box had it, e.g. not when Esc already did. */
+	if (*text == '\0' && gtk_widget_get_visible(st->filter_bar)) {
+		GtkWidget *cur = gtk_window_get_focus(GTK_WINDOW(st->window));
+		gboolean had_focus = cur && (cur == st->filter_entry || gtk_widget_is_ancestor(cur, st->filter_entry));
+		gtk_widget_set_visible(st->filter_bar, FALSE);
+		if (had_focus) gtk_widget_grab_focus(st->list_view);
+	}
+}
+
+/* Show the filter box (it is hidden until you type) and put `chars` in it */
+static void
+filter_begin(State *st, const char *chars)
+{
+	gtk_widget_set_visible(st->filter_bar, TRUE);
+	gtk_widget_grab_focus(st->filter_entry);
+	gtk_editable_set_position(GTK_EDITABLE(st->filter_entry), -1);   /* grab_focus selects all: undo that */
+	if (chars) {
+		int pos = -1;
+		gtk_editable_insert_text(GTK_EDITABLE(st->filter_entry), chars, -1, &pos);
+		gtk_editable_set_position(GTK_EDITABLE(st->filter_entry), -1);
+	}
+}
+
+/* Back to the list. `clear`: also drop the filter and hide the box. */
+static void
+filter_end(State *st, gboolean clear)
+{
+	if (clear) {
+		gtk_editable_set_text(GTK_EDITABLE(st->filter_entry), "");   /* fires on_filter_changed */
+		gtk_widget_set_visible(st->filter_bar, FALSE);
+	}
+	gtk_widget_grab_focus(st->list_view);
+}
+
+/* Enter in the filter box: keep the filter and go back to the list (an empty one just closes) */
+static void
+on_filter_activate(GtkWidget *entry, gpointer user_data)
+{
+	State *st = user_data;
+	filter_end(st, *gtk_editable_get_text(GTK_EDITABLE(entry)) == '\0');
 }
 
 /* Remember whether the list or the terminal had focus, to give it back on close */
@@ -1202,6 +1457,7 @@ build_menu_layer(State *st)
 	st->menu_first = first;
 	gtk_box_append(GTK_BOX(main_page), first);
 	gtk_box_append(GTK_BOX(main_page), nav_button(stack, "Cheat sheet", "cheat", TRUE));
+	gtk_box_append(GTK_BOX(main_page), nav_button(stack, "Sorting", "sort", TRUE));
 	gtk_box_append(GTK_BOX(main_page), nav_button(stack, "File info bar", "info", TRUE));
 	gtk_box_append(GTK_BOX(main_page), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
 	GtkWidget *hidden = switch_row(st, "Show hidden files", &st->cfg.show_hidden);
@@ -1214,6 +1470,7 @@ build_menu_layer(State *st)
 	gtk_stack_add_named(GTK_STACK(stack), main_page, "main");
 	gtk_stack_add_named(GTK_STACK(stack), build_theme_page(st, stack), "theme");
 	gtk_stack_add_named(GTK_STACK(stack), build_cheat_page(st, stack), "cheat");
+	gtk_stack_add_named(GTK_STACK(stack), build_sort_page(st, stack), "sort");
 	gtk_stack_add_named(GTK_STACK(stack), build_info_page(st, stack), "info");
 
 	/* The panel is as tall as the window; a tall page scrolls instead of spilling out */
@@ -1320,7 +1577,7 @@ activate(GtkApplication *app, gpointer user_data)
 
 	/* File list of the home directory */
 	GFile *home = g_file_new_for_path(g_get_home_dir());
-	GtkDirectoryList *dir_list = gtk_directory_list_new("standard::name,standard::display-name,standard::icon", home);
+	GtkDirectoryList *dir_list = gtk_directory_list_new("standard::name,standard::display-name,standard::icon,standard::type,standard::size,time::modified,time::created", home);
 	/* watch the folder, so files created or deleted by commands show up by themselves */
 	gtk_directory_list_set_monitored(dir_list, TRUE);
 	g_object_unref(home);
@@ -1333,7 +1590,8 @@ activate(GtkApplication *app, gpointer user_data)
 	g_signal_connect(terminal, "window-title-changed", G_CALLBACK(on_title_changed), st);
 	g_signal_connect(dir_list, "items-changed", G_CALLBACK(on_dir_items_changed), st);
 
-	GtkSorter *sorter = GTK_SORTER(gtk_custom_sorter_new(compare_info, NULL, NULL));
+	GtkSorter *sorter = GTK_SORTER(gtk_custom_sorter_new(compare_info, st, NULL));
+	st->sorter = sorter;
 
 	/* The list shows the real files AND the ghost rows, merged into one model */
 	GListStore *sources = g_list_store_new(G_TYPE_OBJECT);   /* holds the two models */
@@ -1374,10 +1632,36 @@ activate(GtkApplication *app, gpointer user_data)
 	gtk_label_set_xalign(GTK_LABEL(st->info_label), 0);
 	gtk_label_set_wrap_mode(GTK_LABEL(st->info_label), PANGO_WRAP_WORD_CHAR);
 	gtk_widget_add_css_class(st->info_label, "fhi-info");
+	/* Filter box: hidden until you type in the list */
+	st->filter_entry = gtk_search_entry_new();
+	gtk_widget_set_hexpand(st->filter_entry, TRUE);
+	/* Ask for almost no width of its own: the box then fills the panel instead of
+	 * widening it, and a long filter scrolls sideways inside the box. */
+	gtk_editable_set_width_chars(GTK_EDITABLE(st->filter_entry), 1);
+	gtk_editable_set_max_width_chars(GTK_EDITABLE(st->filter_entry), 1);
+	gtk_widget_set_tooltip_text(st->filter_entry,
+	    "Shell patterns: *.png  report?  {a,b}*  !*.o\nEnter keeps the filter, Esc clears it");
+	g_signal_connect(st->filter_entry, "changed", G_CALLBACK(on_filter_changed), st);
+	g_signal_connect(st->filter_entry, "activate", G_CALLBACK(on_filter_activate), st);
+	st->filter_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+	gtk_widget_add_css_class(st->filter_bar, "fhi-top");
+	gtk_box_append(GTK_BOX(st->filter_bar), st->filter_entry);
+	gtk_widget_set_visible(st->filter_bar, FALSE);
+
+	/* Bottom row: file info, and a faint sort hint on the right */
+	gtk_widget_set_hexpand(st->info_label, TRUE);
+	st->sort_label = gtk_label_new(NULL);
+	gtk_widget_add_css_class(st->sort_label, "fhi-sort");
+	gtk_widget_set_visible(st->sort_label, FALSE);
+	GtkWidget *bottom = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+	gtk_box_append(GTK_BOX(bottom), st->info_label);
+	gtk_box_append(GTK_BOX(bottom), st->sort_label);
+
 	GtkWidget *left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 	gtk_box_append(GTK_BOX(left), scroller);
+	gtk_box_append(GTK_BOX(left), st->filter_bar);
 	gtk_box_append(GTK_BOX(left), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
-	gtk_box_append(GTK_BOX(left), st->info_label);
+	gtk_box_append(GTK_BOX(left), bottom);
 	g_signal_connect(selection, "notify::selected-item", G_CALLBACK(on_selection_changed), st);
 
 	/* Hamburger button in the title bar */
@@ -1401,7 +1685,10 @@ activate(GtkApplication *app, gpointer user_data)
 int
 main(int argc, char *argv[])
 {
-	GtkApplication *app = gtk_application_new("dev.forcedev.myterm", G_APPLICATION_DEFAULT_FLAGS);
+	GtkApplication *app = gtk_application_new("dev.forcedev.myterm", G_APPLICATION_NON_UNIQUE);
+	/* NON_UNIQUE: every launch is its own process. With the default, starting FHI
+	 * while another one runs only opens a window inside the OLD process, so a
+	 * freshly built version would silently never start. */
 	g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
 	int status = g_application_run(G_APPLICATION(app), argc, argv);
 	g_object_unref(app);
