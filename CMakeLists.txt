@@ -22,3 +22,6 @@ target_link_libraries(FHI PRIVATE PkgConfig::GTK4 PkgConfig::VTE)
 # Folder with the zsh startup files; the program tells zsh to read them via ZDOTDIR.
 # For a packaged build, replace this with the installed location of that folder.
 target_compile_definitions(FHI PRIVATE FHI_ZSH_DIR="${CMAKE_CURRENT_SOURCE_DIR}/zsh")
+
+# Folder with the window icon (icons/fhi.png), same idea as FHI_ZSH_DIR
+target_compile_definitions(FHI PRIVATE FHI_ICON_DIR="${CMAKE_CURRENT_SOURCE_DIR}/icons")

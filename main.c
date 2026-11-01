@@ -2,7 +2,33 @@
 #include <vte/vte.h>
 #include <string.h>
 #include <unistd.h> /* tcgetpgrp() */
+#include <stdio.h>
+#include <glib/gstdio.h>
 #include "preview.h"
+
+/* Indexes into Settings.col */
+enum { C_TOUCH, C_CREATE, C_DEST, C_REMOVE, C_TERM_BG, C_TERM_FG, C_COUNT };
+static const char *const color_default[C_COUNT] = {
+	"#e5a50a", "#26a269", "#3584e4", "#e01b24", "#1e1e1e", "#d0d0d0"
+};
+static const char *const color_key[C_COUNT] = {
+	"touch", "create", "dest", "remove", "term_bg", "term_fg"
+};
+static const char *const color_label[C_COUNT] = {
+	"Mentioned file", "Created file", "Destination", "Removed file",
+	"Terminal background", "Terminal text"
+};
+
+/* Everything the hamburger menu can change. Saved in ~/.config/fhi/settings.ini */
+typedef struct {
+	int scheme;                 /* 0 = follow system, 1 = light, 2 = dark */
+	GdkRGBA col[C_COUNT];
+	gboolean custom_term;       /* use col[C_TERM_*] instead of VTE's defaults */
+	gboolean show_hidden;       /* list files starting with "." */
+	gboolean info_type, info_size, info_created, info_accessed;
+	gboolean info_wrap;         /* wrap the info bar instead of cutting it off */
+	int info_font;              /* font size of the info bar, in points */
+} Settings;
 
 /*
  * Everything the callbacks need to share. GTK callbacks only receive ONE
@@ -25,6 +51,21 @@ typedef struct {
 	char *ghost_key;                 /* names of the current ghosts, to spot changes */
 	guint preview_idle;              /* id of a scheduled update_preview(), 0 if none */
 	guint resync_timer;              /* id of a scheduled resync_directory(), 0 if none */
+
+	/* --- hamburger menu --- */
+	Settings cfg;
+	gboolean system_dark;            /* the system's dark-theme setting at startup */
+	GtkCssProvider *css;             /* rebuilt whenever a theme setting changes */
+	GtkFilter *hidden_filter;        /* hides dotfiles when cfg.show_hidden is off */
+	GtkWidget *info_label;           /* the file info bar under the list */
+	GtkWidget *menu_button;          /* toggle button in the title bar */
+	GtkWidget *menu_layer;           /* the menu panel + click-away area, over the window */
+	GtkWidget *menu_stack;
+	GtkWidget *menu_first;           /* first button of the main page, gets focus on open */
+	GtkWidget *last_pane;            /* list or terminal: where focus goes after the menu closes */
+	GtkWidget *scheme_dd;            /* theme page widgets, kept so "Reset" can update them */
+	GtkWidget *color_btn[C_COUNT];
+	GtkWidget *term_switch;
 } State;
 
 static void
@@ -441,6 +482,8 @@ paste_selected_path(State *st)
 	gtk_widget_grab_focus(st->terminal);
 }
 
+static void menu_set_open(State *st, gboolean open);
+
 /*
  * Keyboard shortcuts for the whole window. Connected in activate() to a
  * GtkEventControllerKey in the CAPTURE phase. Normally a key press travels
@@ -457,8 +500,28 @@ on_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode,
 	State *st = user_data;
 
 	/* Keep only the "real" modifiers (Shift, Ctrl, Alt...) and ignore things
-	 * like NumLock, then require that Shift is the only one held down. */
+	 * like NumLock. */
 	modifiers &= gtk_accelerator_get_default_mod_mask();
+
+	/* Tab in the file list opens the hamburger menu (in the terminal it stays
+	 * a normal Tab, for completion). */
+	if (modifiers == 0 && keyval == GDK_KEY_Tab) {
+		GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(st->window));
+		if (focus != NULL && (focus == st->list_view ||
+		                      gtk_widget_is_ancestor(focus, st->list_view))) {
+			menu_set_open(st, TRUE);
+			return TRUE;
+		}
+		return FALSE;
+	}
+
+	/* Esc closes the menu */
+	if (modifiers == 0 && keyval == GDK_KEY_Escape && gtk_widget_get_visible(st->menu_layer)) {
+		menu_set_open(st, FALSE);
+		return TRUE;
+	}
+
+	/* The rest are Shift+key shortcuts */
 	if (modifiers != GDK_SHIFT_MASK) return FALSE;
 
 	switch (keyval) {
@@ -485,6 +548,697 @@ on_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode,
 	}
 }
 
+/* ======================================================================== */
+/* Hamburger menu: settings, theme, cheat sheet, file info                    */
+/* ======================================================================== */
+
+static void
+settings_defaults(Settings *c)
+{
+	c->scheme = 0;
+	for (int i = 0; i < C_COUNT; i++) gdk_rgba_parse(&c->col[i], color_default[i]);
+	c->custom_term = FALSE;
+	c->show_hidden = TRUE;
+	c->info_type = c->info_size = c->info_created = c->info_accessed = TRUE;
+	c->info_wrap = FALSE;
+	c->info_font = 9;
+}
+
+static char *
+settings_path(void)
+{
+	return g_build_filename(g_get_user_config_dir(), "fhi", "settings.ini", NULL);
+}
+
+static void
+kf_get_bool(GKeyFile *kf, const char *key, gboolean *out)
+{
+	if (g_key_file_has_key(kf, "fhi", key, NULL))
+		*out = g_key_file_get_boolean(kf, "fhi", key, NULL);
+}
+
+static void
+load_settings(State *st)
+{
+	Settings *c = &st->cfg;
+	GKeyFile *kf = g_key_file_new();
+	char *path = settings_path();
+	if (g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL)) {
+		if (g_key_file_has_key(kf, "fhi", "scheme", NULL))
+			c->scheme = CLAMP(g_key_file_get_integer(kf, "fhi", "scheme", NULL), 0, 2);
+		if (g_key_file_has_key(kf, "fhi", "info_font", NULL))
+			c->info_font = CLAMP(g_key_file_get_integer(kf, "fhi", "info_font", NULL), 6, 32);
+		for (int i = 0; i < C_COUNT; i++) {
+			char *v = g_key_file_get_string(kf, "fhi", color_key[i], NULL);
+			if (v) gdk_rgba_parse(&c->col[i], v);
+			g_free(v);
+		}
+		kf_get_bool(kf, "custom_term", &c->custom_term);
+		kf_get_bool(kf, "show_hidden", &c->show_hidden);
+		kf_get_bool(kf, "info_type", &c->info_type);
+		kf_get_bool(kf, "info_size", &c->info_size);
+		kf_get_bool(kf, "info_created", &c->info_created);
+		kf_get_bool(kf, "info_accessed", &c->info_accessed);
+		kf_get_bool(kf, "info_wrap", &c->info_wrap);
+	}
+	g_free(path);
+	g_key_file_unref(kf);
+}
+
+static void
+save_settings(State *st)
+{
+	Settings *c = &st->cfg;
+	GKeyFile *kf = g_key_file_new();
+	g_key_file_set_integer(kf, "fhi", "scheme", c->scheme);
+	g_key_file_set_integer(kf, "fhi", "info_font", c->info_font);
+	for (int i = 0; i < C_COUNT; i++) {
+		char *v = gdk_rgba_to_string(&c->col[i]);
+		g_key_file_set_string(kf, "fhi", color_key[i], v);
+		g_free(v);
+	}
+	g_key_file_set_boolean(kf, "fhi", "custom_term", c->custom_term);
+	g_key_file_set_boolean(kf, "fhi", "show_hidden", c->show_hidden);
+	g_key_file_set_boolean(kf, "fhi", "info_type", c->info_type);
+	g_key_file_set_boolean(kf, "fhi", "info_size", c->info_size);
+	g_key_file_set_boolean(kf, "fhi", "info_created", c->info_created);
+	g_key_file_set_boolean(kf, "fhi", "info_accessed", c->info_accessed);
+	g_key_file_set_boolean(kf, "fhi", "info_wrap", c->info_wrap);
+
+	char *path = settings_path();
+	char *dir = g_path_get_dirname(path);
+	g_mkdir_with_parents(dir, 0700);
+	g_key_file_save_to_file(kf, path, NULL);
+	g_free(dir);
+	g_free(path);
+	g_key_file_unref(kf);
+}
+
+/* ---- file info bar ------------------------------------------------------ */
+
+/* Work out what a file is from its first bytes, ignoring the file name. */
+static char *
+sniff_type(const guchar *b, gsize n)
+{
+	static const struct { const char *magic; gsize len; const char *name; } table[] = {
+		{ "\x89PNG\r\n\x1a\n", 8, "PNG image" },
+		{ "\xff\xd8\xff", 3, "JPEG image" },
+		{ "GIF87a", 6, "GIF image" },
+		{ "GIF89a", 6, "GIF image" },
+		{ "II*\0", 4, "TIFF image" },
+		{ "MM\0*", 4, "TIFF image" },
+		{ "\0\0\1\0", 4, "ICO icon" },
+		{ "%PDF-", 5, "PDF document" },
+		{ "PK\3\4", 4, "ZIP archive" },
+		{ "\x1f\x8b", 2, "gzip archive" },
+		{ "BZh", 3, "bzip2 archive" },
+		{ "\xfd" "7zXZ\0", 6, "xz archive" },
+		{ "7z\xbc\xaf\x27\x1c", 6, "7-Zip archive" },
+		{ "Rar!\x1a\7", 6, "RAR archive" },
+		{ "\x7f" "ELF", 4, "ELF executable" },
+		{ "SQLite format 3\0", 16, "SQLite database" },
+		{ "OggS", 4, "Ogg media" },
+		{ "fLaC", 4, "FLAC audio" },
+		{ "ID3", 3, "MP3 audio" },
+		{ "\x1a\x45\xdf\xa3", 4, "Matroska/WebM video" },
+		{ "wOFF", 4, "WOFF font" },
+		{ "wOF2", 4, "WOFF2 font" },
+	};
+	for (guint i = 0; i < G_N_ELEMENTS(table); i++)
+		if (n >= table[i].len && memcmp(b, table[i].magic, table[i].len) == 0)
+			return g_strdup(table[i].name);
+
+	if (n >= 12 && memcmp(b, "RIFF", 4) == 0) {
+		if (memcmp(b + 8, "WEBP", 4) == 0) return g_strdup("WebP image");
+		if (memcmp(b + 8, "WAVE", 4) == 0) return g_strdup("WAV audio");
+		if (memcmp(b + 8, "AVI ", 4) == 0) return g_strdup("AVI video");
+	}
+	if (n >= 12 && memcmp(b + 4, "ftyp", 4) == 0) return g_strdup("MP4/MOV video");
+	if (n >= 2 && b[0] == '#' && b[1] == '!') return g_strdup("Script");
+
+	/* Let the shared-mime-info database have a go, then fall back to text/binary */
+	gboolean uncertain = FALSE;
+	char *mime = g_content_type_guess(NULL, b, n, &uncertain);
+	if (!uncertain && mime && !g_content_type_is_unknown(mime)) {
+		char *desc = g_content_type_get_description(mime);
+		g_free(mime);
+		if (desc) return desc;
+		return g_strdup("Known file");
+	}
+	g_free(mime);
+
+	gboolean text = n > 0 && memchr(b, 0, n) == NULL;
+	if (text) {
+		/* a cut-off multi-byte character at the end is fine, so only check the start */
+		const char *end;
+		g_utf8_validate((const char *)b, n, &end);
+		if ((gsize)((const guchar *)end - b) + 4 < n) text = FALSE;
+	}
+	return g_strdup(text ? "Text file" : "Binary data");
+}
+
+static char *
+describe_type(GFile *file, GFileInfo *fi)
+{
+	switch (g_file_info_get_file_type(fi)) {
+	case G_FILE_TYPE_DIRECTORY: return g_strdup("Folder");
+	case G_FILE_TYPE_REGULAR: break;
+	default: return g_strdup("Special file");   /* pipe, socket, device: never read these */
+	}
+
+	guchar buf[512];
+	gsize n = 0;
+	char *path = g_file_get_path(file);
+	FILE *f = path ? fopen(path, "rb") : NULL;
+	if (f) { n = fread(buf, 1, sizeof buf, f); fclose(f); }
+	g_free(path);
+
+	if (!f) return g_strdup("Unreadable");
+	if (n == 0) return g_strdup("Empty file");
+	return sniff_type(buf, n);
+}
+
+static void
+add_field(GString *out, const char *label, const char *value)
+{
+	if (out->len) g_string_append(out, "   ·   ");
+	g_string_append_printf(out, "%s: %s", label, value);
+}
+
+static char *
+format_time(GDateTime *dt)
+{
+	if (dt == NULL) return g_strdup("n/a");
+	GDateTime *local = g_date_time_to_local(dt);
+	char *text = g_date_time_format(local, "%Y-%m-%d %H:%M");
+	g_date_time_unref(local);
+	return text;
+}
+
+static void
+update_info(State *st)
+{
+	if (st->info_label == NULL) return;
+	Settings *c = &st->cfg;
+	GtkLabel *label = GTK_LABEL(st->info_label);
+	gboolean any = c->info_type || c->info_size || c->info_created || c->info_accessed;
+
+	gtk_label_set_wrap(label, c->info_wrap);
+	gtk_label_set_ellipsize(label, c->info_wrap ? PANGO_ELLIPSIZE_NONE : PANGO_ELLIPSIZE_END);
+	gtk_widget_set_visible(st->info_label, any);
+	if (!any) return;
+
+	GString *out = g_string_new(NULL);
+	GFileInfo *sel = st->selection ? gtk_single_selection_get_selected_item(st->selection) : NULL;
+	GFile *file = sel ? G_FILE(g_file_info_get_attribute_object(sel, "standard::file")) : NULL;
+
+	if (file == NULL) {
+		g_string_assign(out, "No file selected");
+	} else if (g_file_info_get_attribute_boolean(sel, "fhi::ghost")) {
+		g_string_assign(out, "Does not exist yet");
+	} else {
+		GFileInfo *fi = g_file_query_info(file,
+		    "standard::type,standard::size,time::created,time::access",
+		    G_FILE_QUERY_INFO_NONE, NULL, NULL);
+		if (fi == NULL) {
+			g_string_assign(out, "Unavailable");
+		} else {
+			char *v;
+			if (c->info_type) {
+				v = describe_type(file, fi);
+				add_field(out, "Type", v);
+				g_free(v);
+			}
+			if (c->info_size && g_file_info_get_file_type(fi) != G_FILE_TYPE_DIRECTORY) {
+				v = g_format_size(g_file_info_get_size(fi));
+				add_field(out, "Size", v);
+				g_free(v);
+			}
+			if (c->info_created) {
+				GDateTime *dt = g_file_info_get_creation_date_time(fi);
+				v = format_time(dt);
+				add_field(out, "Created", v);
+				g_free(v);
+				if (dt) g_date_time_unref(dt);
+			}
+			if (c->info_accessed) {
+				GDateTime *dt = g_file_info_get_access_date_time(fi);
+				v = format_time(dt);
+				add_field(out, "Accessed", v);
+				g_free(v);
+				if (dt) g_date_time_unref(dt);
+			}
+			g_object_unref(fi);
+		}
+	}
+	gtk_label_set_text(label, out->str);
+	gtk_widget_set_tooltip_text(st->info_label, out->str);   /* full text when cut off */
+	g_string_free(out, TRUE);
+}
+
+static void
+on_selection_changed(GObject *selection, GParamSpec *pspec, gpointer user_data)
+{
+	update_info(user_data);
+}
+
+static gboolean
+hidden_filter_func(gpointer item, gpointer user_data)
+{
+	State *st = user_data;
+	if (st->cfg.show_hidden) return TRUE;
+	const char *name = g_file_info_get_name(G_FILE_INFO(item));
+	return name == NULL || name[0] != '.';
+}
+
+/* ---- applying settings -------------------------------------------------- */
+
+static char *
+rgb_css(const GdkRGBA *c)
+{
+	GdkRGBA o = *c;
+	o.alpha = 1.0;
+	return gdk_rgba_to_string(&o);
+}
+
+/* Push every setting to the UI. `save` is FALSE only for the first call at startup. */
+static void
+apply_all(State *st, gboolean save)
+{
+	Settings *c = &st->cfg;
+
+	/* light / dark */
+	gboolean dark = c->scheme == 0 ? st->system_dark : c->scheme == 2;
+	g_object_set(gtk_settings_get_default(), "gtk-application-prefer-dark-theme", dark, NULL);
+
+	/* style sheet: row highlight colors + info bar font */
+	char *col[4];
+	for (int i = 0; i < 4; i++) col[i] = rgb_css(&c->col[i]);
+	char *css = g_strdup_printf(
+	    ".fhi-row    { padding: 2px 6px; border-radius: 4px; }"
+	    ".fhi-touch  { background: alpha(%s, 0.30); }"
+	    ".fhi-create { background: alpha(%s, 0.40); }"
+	    ".fhi-dest   { background: alpha(%s, 0.40); }"
+	    ".fhi-remove { background: alpha(%s, 0.40); }"
+	    ".fhi-ghost label { font-style: italic; }"
+	    ".fhi-info   { font-size: %dpt; padding: 4px 8px; opacity: 0.85; }"
+	    ".fhi-key    { font-family: monospace; padding: 0 6px; border-radius: 4px;"
+	    "              border: 1px solid alpha(currentColor, 0.35);"
+	    "              background: alpha(currentColor, 0.08); }"
+	    ".fhi-menu   { background-color: @theme_bg_color; padding: 8px 10px;"
+	    "              border-right: 1px solid alpha(currentColor, 0.25);"
+	    "              box-shadow: 4px 0 14px alpha(black, 0.35); }"
+	    ".fhi-swatch { min-width: 14px; min-height: 14px; border-radius: 3px; }",
+	    col[0], col[1], col[2], col[3], c->info_font);
+	gtk_css_provider_load_from_data(st->css, css, -1);
+	g_free(css);
+	for (int i = 0; i < 4; i++) g_free(col[i]);
+
+	/* terminal colors */
+	VteTerminal *term = VTE_TERMINAL(st->terminal);
+	if (c->custom_term) {
+		vte_terminal_set_color_background(term, &c->col[C_TERM_BG]);
+		vte_terminal_set_color_foreground(term, &c->col[C_TERM_FG]);
+	} else {
+		vte_terminal_set_default_colors(term);
+	}
+
+	gtk_filter_changed(st->hidden_filter, GTK_FILTER_CHANGE_DIFFERENT);
+	update_info(st);
+	if (save) save_settings(st);
+}
+
+/* ---- widgets ------------------------------------------------------------ */
+
+static void
+on_flag_changed(GObject *w, GParamSpec *pspec, gpointer user_data)
+{
+	State *st = user_data;
+	gboolean *flag = g_object_get_data(w, "flag");
+	gboolean value;
+	g_object_get(w, "active", &value, NULL);
+	*flag = value;
+	apply_all(st, TRUE);
+}
+
+static GtkWidget *
+switch_row(State *st, const char *text, gboolean *flag)
+{
+	GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+	GtkWidget *label = gtk_label_new(text);
+	GtkWidget *sw = gtk_switch_new();
+	gtk_label_set_xalign(GTK_LABEL(label), 0);
+	gtk_widget_set_hexpand(label, TRUE);
+	gtk_switch_set_active(GTK_SWITCH(sw), *flag);
+	gtk_widget_set_valign(sw, GTK_ALIGN_CENTER);
+	g_object_set_data(G_OBJECT(sw), "flag", flag);
+	g_signal_connect(sw, "notify::active", G_CALLBACK(on_flag_changed), st);
+	gtk_box_append(GTK_BOX(row), label);
+	gtk_box_append(GTK_BOX(row), sw);
+	return row;
+}
+
+static GtkWidget *
+check_row(State *st, const char *text, gboolean *flag)
+{
+	GtkWidget *cb = gtk_check_button_new_with_label(text);
+	gtk_check_button_set_active(GTK_CHECK_BUTTON(cb), *flag);
+	g_object_set_data(G_OBJECT(cb), "flag", flag);
+	g_signal_connect(cb, "notify::active", G_CALLBACK(on_flag_changed), st);
+	return cb;
+}
+
+static void
+on_nav(GtkButton *button, gpointer stack)
+{
+	gtk_stack_set_visible_child_name(GTK_STACK(stack), g_object_get_data(G_OBJECT(button), "page"));
+}
+
+/* "Theme  ›" style button that switches the menu to another page */
+static GtkWidget *
+nav_button(GtkWidget *stack, const char *text, const char *page, gboolean arrow)
+{
+	GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+	GtkWidget *label = gtk_label_new(text);
+	gtk_label_set_xalign(GTK_LABEL(label), 0);
+	gtk_widget_set_hexpand(label, TRUE);
+	gtk_box_append(GTK_BOX(row), label);
+	if (arrow) gtk_box_append(GTK_BOX(row), gtk_image_new_from_icon_name("go-next-symbolic"));
+
+	GtkWidget *button = gtk_button_new();
+	gtk_button_set_child(GTK_BUTTON(button), row);
+	gtk_button_set_has_frame(GTK_BUTTON(button), FALSE);
+	g_object_set_data(G_OBJECT(button), "page", (gpointer)page);
+	g_signal_connect(button, "clicked", G_CALLBACK(on_nav), stack);
+	return button;
+}
+
+/* A page of the menu with a "‹ Title" back button at the top */
+static GtkWidget *
+sub_page(GtkWidget *stack, const char *title)
+{
+	GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+	GtkWidget *back = gtk_button_new();
+	GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+	GtkWidget *label = gtk_label_new(title);
+	gtk_widget_add_css_class(label, "heading");
+	gtk_box_append(GTK_BOX(row), gtk_image_new_from_icon_name("go-previous-symbolic"));
+	gtk_box_append(GTK_BOX(row), label);
+	gtk_button_set_child(GTK_BUTTON(back), row);
+	gtk_button_set_has_frame(GTK_BUTTON(back), FALSE);
+	gtk_widget_set_halign(back, GTK_ALIGN_START);
+	g_object_set_data(G_OBJECT(back), "page", (gpointer)"main");
+	g_signal_connect(back, "clicked", G_CALLBACK(on_nav), stack);
+	gtk_box_append(GTK_BOX(page), back);
+	gtk_box_append(GTK_BOX(page), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+	return page;
+}
+
+static void
+on_color_set(GtkColorButton *button, gpointer user_data)
+{
+	State *st = user_data;
+	int i = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "idx"));
+	gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(button), &st->cfg.col[i]);
+	apply_all(st, TRUE);
+}
+
+static GtkWidget *
+color_row(State *st, int idx)
+{
+	GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+	GtkWidget *label = gtk_label_new(color_label[idx]);
+	GtkWidget *button = gtk_color_button_new_with_rgba(&st->cfg.col[idx]);
+	gtk_label_set_xalign(GTK_LABEL(label), 0);
+	gtk_widget_set_hexpand(label, TRUE);
+	g_object_set_data(G_OBJECT(button), "idx", GINT_TO_POINTER(idx));
+	g_signal_connect(button, "color-set", G_CALLBACK(on_color_set), st);
+	gtk_box_append(GTK_BOX(row), label);
+	gtk_box_append(GTK_BOX(row), button);
+	st->color_btn[idx] = button;
+	return row;
+}
+
+static void
+on_scheme_changed(GObject *dd, GParamSpec *pspec, gpointer user_data)
+{
+	State *st = user_data;
+	st->cfg.scheme = gtk_drop_down_get_selected(GTK_DROP_DOWN(dd));
+	apply_all(st, TRUE);
+}
+
+static void
+on_reset_theme(GtkButton *button, gpointer user_data)
+{
+	State *st = user_data;
+	Settings fresh;
+	settings_defaults(&fresh);
+	/* Setting the widgets fires their signals, which update st->cfg and the UI */
+	gtk_drop_down_set_selected(GTK_DROP_DOWN(st->scheme_dd), fresh.scheme);
+	for (int i = 0; i < C_COUNT; i++)
+		gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(st->color_btn[i]), &fresh.col[i]);
+	gtk_switch_set_active(GTK_SWITCH(st->term_switch), fresh.custom_term);
+	for (int i = 0; i < C_COUNT; i++) st->cfg.col[i] = fresh.col[i];   /* set_rgba is silent */
+	st->cfg.scheme = fresh.scheme;
+	st->cfg.custom_term = fresh.custom_term;
+	apply_all(st, TRUE);
+}
+
+static GtkWidget *
+build_theme_page(State *st, GtkWidget *stack)
+{
+	GtkWidget *page = sub_page(stack, "Theme");
+
+	GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+	GtkWidget *label = gtk_label_new("Color scheme");
+	const char *const schemes[] = { "System", "Light", "Dark", NULL };
+	st->scheme_dd = gtk_drop_down_new_from_strings(schemes);
+	gtk_drop_down_set_selected(GTK_DROP_DOWN(st->scheme_dd), st->cfg.scheme);
+	gtk_label_set_xalign(GTK_LABEL(label), 0);
+	gtk_widget_set_hexpand(label, TRUE);
+	g_signal_connect(st->scheme_dd, "notify::selected", G_CALLBACK(on_scheme_changed), st);
+	gtk_box_append(GTK_BOX(row), label);
+	gtk_box_append(GTK_BOX(row), st->scheme_dd);
+	gtk_box_append(GTK_BOX(page), row);
+
+	GtkWidget *hl = gtk_label_new("Command preview highlights");
+	gtk_label_set_xalign(GTK_LABEL(hl), 0);
+	gtk_widget_add_css_class(hl, "dim-label");
+	gtk_box_append(GTK_BOX(page), hl);
+	for (int i = C_TOUCH; i <= C_REMOVE; i++) gtk_box_append(GTK_BOX(page), color_row(st, i));
+
+	GtkWidget *tl = gtk_label_new("Terminal");
+	gtk_label_set_xalign(GTK_LABEL(tl), 0);
+	gtk_widget_add_css_class(tl, "dim-label");
+	gtk_box_append(GTK_BOX(page), tl);
+	GtkWidget *sw_row = switch_row(st, "Custom colors", &st->cfg.custom_term);
+	st->term_switch = gtk_widget_get_last_child(sw_row);
+	gtk_box_append(GTK_BOX(page), sw_row);
+	gtk_box_append(GTK_BOX(page), color_row(st, C_TERM_BG));
+	gtk_box_append(GTK_BOX(page), color_row(st, C_TERM_FG));
+
+	GtkWidget *reset = gtk_button_new_with_label("Reset to defaults");
+	g_signal_connect(reset, "clicked", G_CALLBACK(on_reset_theme), st);
+	gtk_box_append(GTK_BOX(page), reset);
+	return page;
+}
+
+static void
+cheat_row(GtkWidget *grid, int row, const char *keys, const char *what)
+{
+	GtkWidget *k = gtk_label_new(keys);
+	GtkWidget *w = gtk_label_new(what);
+	gtk_widget_add_css_class(k, "fhi-key");
+	gtk_widget_set_halign(k, GTK_ALIGN_START);
+	gtk_widget_set_valign(k, GTK_ALIGN_START);
+	gtk_label_set_xalign(GTK_LABEL(w), 0);
+	gtk_label_set_wrap(GTK_LABEL(w), TRUE);
+	gtk_label_set_max_width_chars(GTK_LABEL(w), 28);
+	gtk_grid_attach(GTK_GRID(grid), k, 0, row, 1, 1);
+	gtk_grid_attach(GTK_GRID(grid), w, 1, row, 1, 1);
+}
+
+static GtkWidget *
+build_cheat_page(State *st, GtkWidget *stack)
+{
+	GtkWidget *page = sub_page(stack, "Cheat sheet");
+	GtkWidget *grid = gtk_grid_new();
+	gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+	gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
+
+	cheat_row(grid, 0, "Shift + ←", "Move to the file list");
+	cheat_row(grid, 1, "Shift + →", "Move to the terminal");
+	cheat_row(grid, 2, "↑  ↓", "Move through the files (file list)");
+	cheat_row(grid, 3, "Enter", "Open the file, or cd into the folder (file list)");
+	cheat_row(grid, 4, "Shift + Enter", "Type the file's path onto the command line (file list)");
+	cheat_row(grid, 5, "Double click", "Same as Enter");
+	cheat_row(grid, 6, "Tab", "Open this menu (file list)");
+	cheat_row(grid, 7, "Esc", "Close this menu");
+	gtk_box_append(GTK_BOX(page), grid);
+
+	GtkWidget *hl = gtk_label_new("Highlight colors while typing");
+	gtk_label_set_xalign(GTK_LABEL(hl), 0);
+	gtk_widget_add_css_class(hl, "dim-label");
+	gtk_box_append(GTK_BOX(page), hl);
+	const char *const classes[] = { "fhi-touch", "fhi-create", "fhi-dest", "fhi-remove" };
+	const char *const meaning[] = { "mentioned / modified", "will be created",
+	                                "destination of mv / cp / ln", "will be deleted" };
+	for (int i = 0; i < 4; i++) {
+		GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+		GtkWidget *swatch = gtk_label_new(NULL);
+		gtk_widget_add_css_class(swatch, "fhi-swatch");
+		gtk_widget_add_css_class(swatch, classes[i]);
+		gtk_widget_set_valign(swatch, GTK_ALIGN_CENTER);
+		GtkWidget *l = gtk_label_new(meaning[i]);
+		gtk_box_append(GTK_BOX(row), swatch);
+		gtk_box_append(GTK_BOX(row), l);
+		gtk_box_append(GTK_BOX(page), row);
+	}
+	return page;
+}
+
+static void
+on_font_changed(GtkSpinButton *spin, gpointer user_data)
+{
+	State *st = user_data;
+	st->cfg.info_font = gtk_spin_button_get_value_as_int(spin);
+	apply_all(st, TRUE);
+}
+
+static GtkWidget *
+build_info_page(State *st, GtkWidget *stack)
+{
+	GtkWidget *page = sub_page(stack, "File info bar");
+	GtkWidget *l = gtk_label_new("Show for the selected file");
+	gtk_label_set_xalign(GTK_LABEL(l), 0);
+	gtk_widget_add_css_class(l, "dim-label");
+	gtk_box_append(GTK_BOX(page), l);
+	gtk_box_append(GTK_BOX(page), check_row(st, "Type (detected from the file header)", &st->cfg.info_type));
+	gtk_box_append(GTK_BOX(page), check_row(st, "Size", &st->cfg.info_size));
+	gtk_box_append(GTK_BOX(page), check_row(st, "Date created", &st->cfg.info_created));
+	gtk_box_append(GTK_BOX(page), check_row(st, "Last accessed", &st->cfg.info_accessed));
+	gtk_box_append(GTK_BOX(page), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+	gtk_box_append(GTK_BOX(page), switch_row(st, "Wrap long info (off = cut off)", &st->cfg.info_wrap));
+
+	GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+	GtkWidget *label = gtk_label_new("Font size (pt)");
+	GtkWidget *spin = gtk_spin_button_new_with_range(6, 32, 1);
+	gtk_label_set_xalign(GTK_LABEL(label), 0);
+	gtk_widget_set_hexpand(label, TRUE);
+	gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), st->cfg.info_font);
+	g_signal_connect(spin, "value-changed", G_CALLBACK(on_font_changed), st);
+	gtk_box_append(GTK_BOX(row), label);
+	gtk_box_append(GTK_BOX(row), spin);
+	gtk_box_append(GTK_BOX(page), row);
+	return page;
+}
+
+/* Remember whether the list or the terminal had focus, to give it back on close */
+static void
+on_focus_changed(GObject *window, GParamSpec *pspec, gpointer user_data)
+{
+	State *st = user_data;
+	GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(window));
+	if (focus == NULL) return;
+	if (focus == st->list_view || gtk_widget_is_ancestor(focus, st->list_view))
+		st->last_pane = st->list_view;
+	else if (focus == st->terminal || gtk_widget_is_ancestor(focus, st->terminal))
+		st->last_pane = st->terminal;
+}
+
+/* Show or hide the menu panel. It lives INSIDE the window (an overlay), so it
+ * can never spill out of it the way a popup window can. */
+static void
+menu_set_open(State *st, gboolean open)
+{
+	if (gtk_widget_get_visible(st->menu_layer) == open) return;
+	gtk_widget_set_visible(st->menu_layer, open);
+	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(st->menu_button), open);   /* keep the button in sync */
+	if (open) {
+		gtk_stack_set_transition_type(GTK_STACK(st->menu_stack), GTK_STACK_TRANSITION_TYPE_NONE);
+		gtk_stack_set_visible_child_name(GTK_STACK(st->menu_stack), "main");
+		gtk_stack_set_transition_type(GTK_STACK(st->menu_stack), GTK_STACK_TRANSITION_TYPE_SLIDE_LEFT_RIGHT);
+		gtk_widget_grab_focus(st->menu_first);
+	} else {
+		gtk_widget_grab_focus(st->last_pane ? st->last_pane : st->terminal);
+	}
+}
+
+static void
+on_menu_button_toggled(GtkToggleButton *button, gpointer user_data)
+{
+	menu_set_open(user_data, gtk_toggle_button_get_active(button));
+}
+
+/* A click on the part of the window next to the panel closes it */
+static void
+on_scrim_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data)
+{
+	menu_set_open(user_data, FALSE);
+}
+
+/* The title bar button. build_menu_layer() makes the panel it opens. */
+static GtkWidget *
+build_menu_button(State *st)
+{
+	GtkWidget *button = gtk_toggle_button_new();
+	gtk_button_set_icon_name(GTK_BUTTON(button), "open-menu-symbolic");
+	gtk_widget_set_focus_on_click(button, FALSE);   /* keep focus where it was */
+	g_signal_connect(button, "toggled", G_CALLBACK(on_menu_button_toggled), st);
+	st->menu_button = button;
+	return button;
+}
+
+static GtkWidget *
+build_menu_layer(State *st)
+{
+	GtkWidget *stack = gtk_stack_new();
+	gtk_stack_set_transition_type(GTK_STACK(stack), GTK_STACK_TRANSITION_TYPE_SLIDE_LEFT_RIGHT);
+	gtk_stack_set_vhomogeneous(GTK_STACK(stack), FALSE);
+	st->menu_stack = stack;
+
+	GtkWidget *main_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+	GtkWidget *first = nav_button(stack, "Theme", "theme", TRUE);
+	st->menu_first = first;
+	gtk_box_append(GTK_BOX(main_page), first);
+	gtk_box_append(GTK_BOX(main_page), nav_button(stack, "Cheat sheet", "cheat", TRUE));
+	gtk_box_append(GTK_BOX(main_page), nav_button(stack, "File info bar", "info", TRUE));
+	gtk_box_append(GTK_BOX(main_page), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+	GtkWidget *hidden = switch_row(st, "Show hidden files", &st->cfg.show_hidden);
+	gtk_widget_set_margin_start(hidden, 12);
+	gtk_widget_set_margin_end(hidden, 12);
+	gtk_widget_set_margin_top(hidden, 4);
+	gtk_widget_set_margin_bottom(hidden, 4);
+	gtk_box_append(GTK_BOX(main_page), hidden);
+
+	gtk_stack_add_named(GTK_STACK(stack), main_page, "main");
+	gtk_stack_add_named(GTK_STACK(stack), build_theme_page(st, stack), "theme");
+	gtk_stack_add_named(GTK_STACK(stack), build_cheat_page(st, stack), "cheat");
+	gtk_stack_add_named(GTK_STACK(stack), build_info_page(st, stack), "info");
+
+	/* The panel is as tall as the window; a tall page scrolls instead of spilling out */
+	GtkWidget *scroller = gtk_scrolled_window_new();
+	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+	gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), stack);
+	gtk_scrolled_window_set_propagate_natural_width(GTK_SCROLLED_WINDOW(scroller), TRUE);
+	gtk_widget_set_size_request(scroller, 300, -1);
+	gtk_widget_add_css_class(scroller, "fhi-menu");
+
+	/* transparent area to the right of the panel: clicking it closes the menu */
+	GtkWidget *scrim = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+	gtk_widget_set_hexpand(scrim, TRUE);
+	GtkGesture *click = gtk_gesture_click_new();
+	g_signal_connect(click, "pressed", G_CALLBACK(on_scrim_pressed), st);
+	gtk_widget_add_controller(scrim, GTK_EVENT_CONTROLLER(click));
+
+	GtkWidget *layer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+	gtk_box_append(GTK_BOX(layer), scroller);
+	gtk_box_append(GTK_BOX(layer), scrim);
+	gtk_widget_set_visible(layer, FALSE);
+	st->menu_layer = layer;
+	return layer;
+}
+
 static void
 activate(GtkApplication *app, gpointer user_data)
 {
@@ -500,19 +1254,14 @@ activate(GtkApplication *app, gpointer user_data)
 	st->bound_rows = g_hash_table_new(g_direct_hash, g_direct_equal);
 	st->ghosts = g_list_store_new(G_TYPE_FILE_INFO);
 
-	/* Colors for the command preview. alpha() makes them see-through, so they
-	 * look right in light and dark themes. */
-	GtkCssProvider *css = gtk_css_provider_new();
-	gtk_css_provider_load_from_data(css,
-	    ".fhi-row    { padding: 2px 6px; border-radius: 4px; }"
-	    ".fhi-touch  { background: alpha(#e5a50a, 0.30); }"   /* yellow: mentioned     */
-	    ".fhi-create { background: alpha(#26a269, 0.40); }"   /* green:  created       */
-	    ".fhi-dest   { background: alpha(#3584e4, 0.40); }"   /* blue:   destination   */
-	    ".fhi-remove { background: alpha(#e01b24, 0.40); }"   /* red:    removed       */
-	    ".fhi-ghost label { font-style: italic; }", -1);
+	/* Settings, then the style sheet that depends on them (see apply_all) */
+	settings_defaults(&st->cfg);
+	load_settings(st);
+	g_object_get(gtk_settings_get_default(), "gtk-application-prefer-dark-theme",
+	             &st->system_dark, NULL);
+	st->css = gtk_css_provider_new();
 	gtk_style_context_add_provider_for_display(gdk_display_get_default(),
-	    GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-	g_object_unref(css);
+	    GTK_STYLE_PROVIDER(st->css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 	GtkWidget *pane = gtk_paned_new (GTK_ORIENTATION_HORIZONTAL);
 	GtkWidget *frame1 = gtk_frame_new (NULL);
 	GtkWidget *frame2 = gtk_frame_new (NULL);
@@ -531,6 +1280,10 @@ activate(GtkApplication *app, gpointer user_data)
 
 	
 	gtk_window_set_title(GTK_WINDOW(window), "FHI-Terminal");
+
+	/* Window icon: icons/fhi.png is found as an "unthemed" icon in that folder */
+	gtk_icon_theme_add_search_path(gtk_icon_theme_get_for_display(gdk_display_get_default()), FHI_ICON_DIR);
+	gtk_window_set_icon_name(GTK_WINDOW(window), "fhi");
 
 	/* Start a new shell */
 	char *command[] = { "zsh", NULL };
@@ -588,7 +1341,11 @@ activate(GtkApplication *app, gpointer user_data)
 	g_list_store_append(sources, st->ghosts);
 	GtkFlattenListModel *merged = gtk_flatten_list_model_new(G_LIST_MODEL(sources));
 
-	GtkSortListModel *sorted = gtk_sort_list_model_new(G_LIST_MODEL(merged), sorter);
+	/* dotfiles can be hidden from the menu; the filter is re-run by apply_all() */
+	st->hidden_filter = GTK_FILTER(gtk_custom_filter_new(hidden_filter_func, st, NULL));
+	GtkFilterListModel *visible = gtk_filter_list_model_new(G_LIST_MODEL(merged), st->hidden_filter);
+
+	GtkSortListModel *sorted = gtk_sort_list_model_new(G_LIST_MODEL(visible), sorter);
 	GtkSingleSelection *selection = gtk_single_selection_new(G_LIST_MODEL(sorted));
 	st->selection = selection;
 
@@ -610,10 +1367,32 @@ activate(GtkApplication *app, gpointer user_data)
 
 	GtkWidget *scroller = gtk_scrolled_window_new();
 	gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), list_view);
+	gtk_widget_set_vexpand(scroller, TRUE);
 
-	gtk_window_set_child(GTK_WINDOW(window), pane);
-	gtk_frame_set_child(GTK_FRAME(frame1), scroller);
+	/* Left panel = file list on top, info bar about the selected file below it */
+	st->info_label = gtk_label_new(NULL);
+	gtk_label_set_xalign(GTK_LABEL(st->info_label), 0);
+	gtk_label_set_wrap_mode(GTK_LABEL(st->info_label), PANGO_WRAP_WORD_CHAR);
+	gtk_widget_add_css_class(st->info_label, "fhi-info");
+	GtkWidget *left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+	gtk_box_append(GTK_BOX(left), scroller);
+	gtk_box_append(GTK_BOX(left), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+	gtk_box_append(GTK_BOX(left), st->info_label);
+	g_signal_connect(selection, "notify::selected-item", G_CALLBACK(on_selection_changed), st);
+
+	/* Hamburger button in the title bar */
+	GtkWidget *header = gtk_header_bar_new();
+	gtk_header_bar_pack_start(GTK_HEADER_BAR(header), build_menu_button(st));
+	gtk_window_set_titlebar(GTK_WINDOW(window), header);
+	g_signal_connect(window, "notify::focus-widget", G_CALLBACK(on_focus_changed), st);
+
+	GtkWidget *overlay = gtk_overlay_new();
+	gtk_overlay_set_child(GTK_OVERLAY(overlay), pane);
+	gtk_overlay_add_overlay(GTK_OVERLAY(overlay), build_menu_layer(st));
+	gtk_window_set_child(GTK_WINDOW(window), overlay);
+	gtk_frame_set_child(GTK_FRAME(frame1), left);
 	gtk_frame_set_child(GTK_FRAME(frame2), terminal);
+	apply_all(st, FALSE);
 	gtk_window_present(GTK_WINDOW(window));
 	gtk_window_set_default_size (GTK_WINDOW(window), 800, 600);
 
