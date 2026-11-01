@@ -642,3 +642,99 @@ fhi_preview_parse(const char *buffer, const char *cwd, const char *const *existi
 	g_hash_table_unref(ctx.existing);
 	return result;
 }
+
+/* ======================================================================== */
+/* 5. File-list filter (reuses the lexer and brace expansion above)          */
+/* ======================================================================== */
+
+typedef struct {
+	char *text;        /* case-folded; for a glob still holds its backslashes */
+	gboolean glob;
+} FilterPat;
+
+struct FhiFilter {
+	GPtrArray *include;   /* FilterPat*: a name must match one of these (if any) */
+	GPtrArray *exclude;   /* FilterPat*: a name must match none of these */
+};
+
+static void
+filter_pat_free(gpointer p)
+{
+	FilterPat *fp = p;
+	g_free(fp->text);
+	g_free(fp);
+}
+
+static char *
+fold(const char *s)
+{
+	return g_utf8_validate(s, -1, NULL) ? g_utf8_casefold(s, -1) : g_strdup(s);
+}
+
+FhiFilter *
+fhi_filter_new(const char *spec)
+{
+	FhiFilter *f = g_new0(FhiFilter, 1);
+	f->include = g_ptr_array_new_with_free_func(filter_pat_free);
+	f->exclude = g_ptr_array_new_with_free_func(filter_pat_free);
+
+	GPtrArray *tokens = lex(spec ? spec : "");
+	for (guint i = 0; i < tokens->len; i++) {
+		const Token *t = tokens->pdata[i];
+		if (t->type != TOK_WORD || t->unknown) continue;
+
+		const char *pattern = t->pattern;
+		gboolean negate = pattern[0] == '!';
+		if (negate) pattern++;
+
+		GPtrArray *alts = g_ptr_array_new_with_free_func(g_free);
+		brace_expand(pattern, alts, 0);
+		for (guint k = 0; k < alts->len; k++) {
+			const char *alt = alts->pdata[k];
+			if (*alt == '\0') continue;
+			FilterPat *fp = g_new0(FilterPat, 1);
+			fp->glob = has_glob(alt);
+			char *base = fp->glob ? g_strdup(alt) : unescape(alt);
+			fp->text = fold(base);
+			g_free(base);
+			g_ptr_array_add(negate ? f->exclude : f->include, fp);
+		}
+		g_ptr_array_unref(alts);
+	}
+	g_ptr_array_unref(tokens);
+	return f;
+}
+
+static gboolean
+filter_pat_matches(const FilterPat *fp, const char *folded_name)
+{
+	if (fp->glob) return fnmatch(fp->text, folded_name, 0) == 0;
+	return strstr(folded_name, fp->text) != NULL;
+}
+
+gboolean
+fhi_filter_matches(const FhiFilter *f, const char *name)
+{
+	if (f == NULL || (f->include->len == 0 && f->exclude->len == 0)) return TRUE;
+
+	char *folded = fold(name);
+	gboolean ok = TRUE;
+	for (guint i = 0; ok && i < f->exclude->len; i++)
+		if (filter_pat_matches(f->exclude->pdata[i], folded)) ok = FALSE;
+	if (ok && f->include->len > 0) {
+		ok = FALSE;
+		for (guint i = 0; !ok && i < f->include->len; i++)
+			ok = filter_pat_matches(f->include->pdata[i], folded);
+	}
+	g_free(folded);
+	return ok;
+}
+
+void
+fhi_filter_free(FhiFilter *f)
+{
+	if (f == NULL) return;
+	g_ptr_array_unref(f->include);
+	g_ptr_array_unref(f->exclude);
+	g_free(f);
+}

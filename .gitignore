@@ -1,0 +1,17 @@
+# Build output (CLion / cmake)
+/cmake-build-*/
+/build/
+
+# The compiled program lands in the project folder (see CMakeLists.txt);
+# it is built from source, and packaged builds go into the .deb instead.
+# Anchored with "/" so FHI.png and the FHI.iml file are NOT matched.
+/FHI
+/main
+
+# Packages from packaging/build-*.sh
+*.deb
+*.tar.gz
+
+# Local tool config: the CLion MCP port changes every session
+/.mcp.json
+/.claude/

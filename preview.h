@@ -35,4 +35,16 @@ typedef struct {
 GPtrArray *fhi_preview_parse(const char *buffer, const char *cwd,
                              const char *const *existing);
 
+/*
+ * A file-list filter typed like shell words:
+ *   *.png   report?   [a-c]*   file{1,2}.txt   "two words"   !*.o
+ * Several words match if ANY of them does; a word starting with ! excludes.
+ * A word without wildcards matches anywhere in the name ("png" finds a.png).
+ * Matching ignores upper/lower case. An empty spec matches everything.
+ */
+typedef struct FhiFilter FhiFilter;
+FhiFilter *fhi_filter_new(const char *spec);
+gboolean   fhi_filter_matches(const FhiFilter *filter, const char *name);
+void       fhi_filter_free(FhiFilter *filter);
+
 #endif
