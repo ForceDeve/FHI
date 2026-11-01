@@ -12,7 +12,7 @@ pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
 # VTE's GTK4 build is a separate package (libvte-2.91-gtk4-dev); plain "vte" is the old GTK2 one
 pkg_check_modules(VTE REQUIRED IMPORTED_TARGET vte-2.91-gtk4)
 
-add_executable(FHI main.c)
+add_executable(FHI main.c preview.c)
 target_link_libraries(FHI PRIVATE PkgConfig::GTK4 PkgConfig::VTE)
 
 # Folder with the zsh startup files; the program tells zsh to read them via ZDOTDIR.
