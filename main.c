@@ -1,6 +1,8 @@
 #include <gtk/gtk.h>
 #include <vte/vte.h>
 
+
+
 static void
 child_ready(VteTerminal *terminal, GPid pid, GError *error, gpointer user_data)
 {
@@ -48,6 +50,43 @@ compare_info(gconstpointer a, gconstpointer b, gpointer user_data)
 	                      g_file_info_get_display_name(G_FILE_INFO((gpointer)b)));
 }
 
+/*
+ * YOUR TURN: called by VTE whenever the shell reports a new working directory.
+ *
+ * Who calls it?  GTK does, from inside the main loop. It runs because
+ * activate() connected it to the terminal's "current-directory-uri-changed"
+ * signal, and that signal fires when zsh prints the OSC 7 escape sequence
+ * from zsh/.zshrc (once before every prompt).
+ *
+ * Arguments:
+ *   terminal  - the VteTerminal that emitted the signal
+ *   user_data - whatever was passed as the last argument of g_signal_connect().
+ *               In activate() that is the GtkDirectoryList that feeds the file
+ *               list on the left.
+ */
+static void
+on_cwd_changed(VteTerminal *terminal, gpointer user_data)
+{
+	GtkDirectoryList *list = GTK_DIRECTORY_LIST(user_data);
+
+	/* VTE owns this string, so we must not free it. NULL means "unknown". */
+	const char *uri = vte_terminal_get_current_directory_uri(terminal);
+	if (uri == NULL) return;
+
+	/* g_file_new_for_uri() decodes "file://" and the %20-style escapes for us */
+	GFile *file = g_file_new_for_uri(uri);
+
+	/* The signal fires before every prompt, even if we did not change folder.
+	 * Only reload the list when the directory really is a different one. */
+	GFile *current = gtk_directory_list_get_file(list); /* not ours: do not unref */
+	if (current == NULL || !g_file_equal(current, file))
+		gtk_directory_list_set_file(list, file);
+
+	/* We created "file", so we release it. The list took its own reference.
+	 * (We never unref "list": we did not create it, the sort model owns it.) */
+	g_object_unref(file);
+}
+
 static void
 activate(GtkApplication *app, gpointer user_data)
 {
@@ -73,27 +112,45 @@ activate(GtkApplication *app, gpointer user_data)
 	gtk_window_set_title(GTK_WINDOW(window), "FHI-Terminal");
 
 	/* Start a new shell */
-	const char *shell = g_getenv("SHELL");
-	char *command[] = { (char *)(shell ? shell : "/bin/sh"), NULL };
+	char *command[] = { "zsh", NULL };
+
+	/*
+	 * Make zsh load OUR startup files (see zsh/.zshrc), which in turn load the
+	 * user's own ones and add the hook that reports the working directory.
+	 *   - FHI_USER_ZDOTDIR: where the user's files live (their ZDOTDIR if they
+	 *     set one, otherwise their home directory)
+	 *   - FHI_ZDOTDIR / ZDOTDIR: our folder (the path is baked in by CMake)
+	 */
+	char **envp = g_get_environ();
+	char *user_zdotdir = g_strdup(g_environ_getenv(envp, "ZDOTDIR"));
+	if (!user_zdotdir) user_zdotdir = g_strdup(g_get_home_dir());
+	envp = g_environ_setenv(envp, "FHI_USER_ZDOTDIR", user_zdotdir, TRUE);
+	envp = g_environ_setenv(envp, "FHI_ZDOTDIR", FHI_ZSH_DIR, TRUE);
+	envp = g_environ_setenv(envp, "ZDOTDIR", FHI_ZSH_DIR, TRUE);
+	g_free(user_zdotdir);
 
 	vte_terminal_spawn_async(VTE_TERMINAL(terminal),
 	    VTE_PTY_DEFAULT,
 	    g_get_home_dir(), /* working directory  */
 	    command,      /* command */
-	    NULL,         /* environment */
-	    G_SPAWN_DEFAULT, /* spawn flags */
+	    envp,         /* environment */
+	    G_SPAWN_SEARCH_PATH, /* spawn flags: look up zsh in PATH */
 	    NULL, NULL, NULL, /* child setup, data, destroy */
 	    -1,           /* timeout */
 	    NULL,         /* cancellable */
 	    child_ready,  /* callback */
 	    window);      /* user_data */
+	g_strfreev(envp); /* VTE made its own copy */
 
 	g_signal_connect(terminal, "child-exited", G_CALLBACK(child_exited), window);
 
 	/* File list of the home directory */
 	GFile *home = g_file_new_for_path(g_get_home_dir());
-	GtkDirectoryList *dir_list = gtk_directory_list_new("standard::display-name,standard::icon", home);
+	GtkDirectoryList *dir_list = gtk_directory_list_new("standard::name,standard::display-name,standard::icon", home);
 	g_object_unref(home);
+
+	/* Update the list whenever the shell reports a new directory */
+	g_signal_connect(terminal, "current-directory-uri-changed", G_CALLBACK(on_cwd_changed), dir_list);
 
 	GtkSorter *sorter = GTK_SORTER(gtk_custom_sorter_new(compare_info, NULL, NULL));
 	GtkSortListModel *sorted = gtk_sort_list_model_new(G_LIST_MODEL(dir_list), sorter);
