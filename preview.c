@@ -1,4 +1,10 @@
 /*
+ * FHI - ForceDev's Hybrid Interface
+ * Copyright (c) 2026 ForceDev (https://github.com/ForceDeve)
+ * Licensed under the FHI License, see the LICENSE file.
+ */
+
+/*
  * preview.c - work out which files a half-typed shell command will affect.
  *
  * The work happens in four steps:

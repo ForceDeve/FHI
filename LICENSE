@@ -12,15 +12,14 @@ use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
 of the Software, and to permit persons to whom the Software is furnished to do
 so, subject to the following conditions:
 
-1. Credit. The above copyright notice, this license, and a visible credit to
-   the original author ("FHI by ForceDev") must be included in all copies or
-   substantial portions of the Software, including modified versions and
-   packages (for example in an "About" page, a README, or the package
-   description).
+1. Credit. The above copyright notice and this license must be kept in the
+   source code of all copies and substantial portions of the Software,
+   including modified versions. This is the only credit required: nothing has
+   to be shown in a program's interface or in package descriptions.
 
-2. Name. Wherever the Software or a modified version of it is distributed or
-   shown, it must keep the name "FHI" (short for "ForceDev's Hybrid
-   Interface"). It may be described as modified, but it may not be renamed.
+2. Name. A modified version may be renamed to anything, as long as the new
+   name still contains the letters "FHI" (for example "FHIR" or "SFHI").
+   Unmodified copies keep the name "FHI".
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,

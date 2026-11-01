@@ -1,3 +1,9 @@
+/*
+ * FHI - ForceDev's Hybrid Interface
+ * Copyright (c) 2026 ForceDev (https://github.com/ForceDeve)
+ * Licensed under the FHI License, see the LICENSE file.
+ */
+
 #include <gtk/gtk.h>
 #include <vte/vte.h>
 #include <string.h>

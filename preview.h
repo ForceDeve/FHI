@@ -1,3 +1,9 @@
+/*
+ * FHI - ForceDev's Hybrid Interface
+ * Copyright (c) 2026 ForceDev (https://github.com/ForceDeve)
+ * Licensed under the FHI License, see the LICENSE file.
+ */
+
 #ifndef FHI_PREVIEW_H
 #define FHI_PREVIEW_H
 

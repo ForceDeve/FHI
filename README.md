@@ -30,7 +30,8 @@ Needs **zsh**, GTK 4 and VTE for GTK 4 (`libvte-2.91-gtk4`: Debian 13+ / Ubuntu 
 
 ## License
 
-Free to use and modify, with two conditions: keep the credit to the author, and keep the name
-**FHI**. See [`LICENSE`](LICENSE).
+Free to use, change and share. Two conditions: keep the author's copyright notice in the source
+code, and if you rename a modified version, the new name must still contain **FHI** (FHIR, SFHI, ...).
+See [`LICENSE`](LICENSE).
 
 *Built by an undergrad learning and making a tool he enjoys himself.*
