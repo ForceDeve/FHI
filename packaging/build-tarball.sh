@@ -3,7 +3,7 @@
 # that it really builds and installs from a clean copy.  Usage: packaging/build-tarball.sh
 set -eu
 
-VERSION=0.1.0
+VERSION=$(cat "$(dirname "$0")/VERSION")
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -12,7 +12,7 @@ mkdir "$WORK/fhi-$VERSION"
 cd "$ROOT"
 cp -r CMakeLists.txt main.c preview.c preview.h zsh icons "$WORK/fhi-$VERSION/"
 mkdir "$WORK/fhi-$VERSION/packaging"
-cp packaging/dev.forcedev.myterm.desktop packaging/INSTALL.txt "$WORK/fhi-$VERSION/packaging/"
+cp packaging/VERSION packaging/dev.forcedev.myterm.desktop packaging/INSTALL.txt "$WORK/fhi-$VERSION/packaging/"
 cp packaging/INSTALL.txt "$WORK/fhi-$VERSION/"
 
 # self-test: build + install from the copy

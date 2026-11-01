@@ -2,7 +2,7 @@
 # Builds fhi_<version>_<arch>.deb into the project folder.  Usage: packaging/build-deb.sh
 set -eu
 
-VERSION=0.1.0
+VERSION=$(cat "$(dirname "$0")/VERSION")
 # Shown to anyone who inspects the package. Override: FHI_MAINTAINER="Name <mail>" packaging/build-deb.sh
 MAINTAINER=${FHI_MAINTAINER:-"ForceDev <forcedev@users.noreply.github.com>"}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
