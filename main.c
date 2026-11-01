@@ -22,11 +22,30 @@ activate(GtkApplication *app, gpointer user_data)
 {
 	GtkWidget *window = gtk_application_window_new(app);
 	GtkWidget *terminal = vte_terminal_new();
+	GtkWidget *lable = gtk_label_new ("FHI file preview \n in the works");
+	GtkWidget *pane = gtk_paned_new (GTK_ORIENTATION_HORIZONTAL);
+	GtkWidget *frame1 = gtk_frame_new (NULL);
+	GtkWidget *frame2 = gtk_frame_new (NULL);
+
+	gtk_widget_set_size_request (pane, 200, -1);
+
+	gtk_paned_set_start_child (GTK_PANED (pane), frame1);
+	gtk_paned_set_resize_start_child (GTK_PANED (pane), FALSE);
+	gtk_paned_set_shrink_start_child (GTK_PANED (pane), FALSE);
+	gtk_widget_set_size_request (frame1, 200, -1);
+
+	gtk_paned_set_end_child (GTK_PANED (pane), frame2);
+	gtk_paned_set_resize_end_child (GTK_PANED (pane), TRUE);
+	gtk_paned_set_shrink_end_child (GTK_PANED (pane), FALSE);
+	gtk_widget_set_size_request (frame2, 50, -1);
+
+	
 	gtk_window_set_title(GTK_WINDOW(window), "FHI-Terminal");
 
 	/* Start a new shell */
 	const char *shell = g_getenv("SHELL");
 	char *command[] = { (char *)(shell ? shell : "/bin/sh"), NULL };
+
 	vte_terminal_spawn_async(VTE_TERMINAL(terminal),
 	    VTE_PTY_DEFAULT,
 	    NULL,         /* working directory  */
@@ -41,7 +60,9 @@ activate(GtkApplication *app, gpointer user_data)
 
 	g_signal_connect(terminal, "child-exited", G_CALLBACK(child_exited), window);
 
-	gtk_window_set_child(GTK_WINDOW(window), terminal);
+	gtk_window_set_child(GTK_WINDOW(window), pane);
+	gtk_frame_set_child(GTK_FRAME(frame1), lable);
+	gtk_frame_set_child(GTK_FRAME(frame2), terminal);
 	gtk_window_present(GTK_WINDOW(window));
 }
 
