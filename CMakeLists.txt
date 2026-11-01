@@ -14,3 +14,7 @@ pkg_check_modules(VTE REQUIRED IMPORTED_TARGET vte-2.91-gtk4)
 
 add_executable(FHI main.c)
 target_link_libraries(FHI PRIVATE PkgConfig::GTK4 PkgConfig::VTE)
+
+# Folder with the zsh startup files; the program tells zsh to read them via ZDOTDIR.
+# For a packaged build, replace this with the installed location of that folder.
+target_compile_definitions(FHI PRIVATE FHI_ZSH_DIR="${CMAKE_CURRENT_SOURCE_DIR}/zsh")
