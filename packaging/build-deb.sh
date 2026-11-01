@@ -4,7 +4,7 @@ set -eu
 
 VERSION=$(cat "$(dirname "$0")/VERSION")
 # Shown to anyone who inspects the package. Override: FHI_MAINTAINER="Name <mail>" packaging/build-deb.sh
-MAINTAINER=${FHI_MAINTAINER:-"ForceDev <forcedev@users.noreply.github.com>"}
+MAINTAINER=${FHI_MAINTAINER:-"ForceDev <62995666+ForceDeve@users.noreply.github.com>"}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 ARCH=$(dpkg --print-architecture)
 WORK=$(mktemp -d)
