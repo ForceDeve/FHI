@@ -914,11 +914,88 @@ run_in_shell(State *st, const char *line)
 	if (focus != NULL) gtk_widget_grab_focus(focus);
 }
 
+/* Who is in front of the terminal right now? */
+typedef enum { FG_OTHER, FG_SHELL, FG_VIM, FG_NANO, FG_PYTHON } Foreground;
+static Foreground foreground_kind(State *st);
+
+/* Is this a file we would edit in a text editor? (source code, config, notes...) */
+static gboolean
+is_text_file(GFile *file)
+{
+	GFileInfo *fi = g_file_query_info(file, "standard::content-type,standard::type", 0, NULL, NULL);
+	if (fi == NULL) return FALSE;
+	gboolean regular = g_file_info_get_file_type(fi) == G_FILE_TYPE_REGULAR;
+	const char *ct = g_file_info_get_content_type(fi);
+	gboolean text = regular && ct != NULL && g_content_type_is_a(ct, "text/plain");
+	gboolean other_media = ct != NULL && (g_str_has_prefix(ct, "image/") || g_str_has_prefix(ct, "audio/") ||
+	                                      g_str_has_prefix(ct, "video/") || g_str_has_prefix(ct, "font/"));
+	g_object_unref(fi);
+	if (text || !regular || other_media) return text;
+
+	/* Not a known text type (a *.toml, a Makefile.in, a PKGBUILD...): text if the start has no NUL byte */
+	gboolean ok = FALSE;
+	GFileInputStream *in = g_file_read(file, NULL, NULL);
+	if (in) {
+		char buf[8192];
+		gssize n = g_input_stream_read(G_INPUT_STREAM(in), buf, sizeof buf, NULL, NULL);
+		ok = n >= 0 && memchr(buf, '\0', (gsize)n) == NULL;
+		g_object_unref(in);
+	}
+	return ok;
+}
+
+/* `path` with the characters that are special on a vim command line escaped, like fnameescape() */
+static char *
+vim_escape(const char *path)
+{
+	GString *out = g_string_new(NULL);
+	for (const char *c = path; *c; c++) {
+		if (strchr(" \t*?[{`$\\%#'\"|!<", *c)) g_string_append_c(out, '\\');
+		g_string_append_c(out, *c);
+	}
+	return g_string_free(out, FALSE);
+}
+
+/*
+ * The editor (vim / nano) is in front and a text file was chosen in the list: save what
+ * is being edited and open the chosen file in the same editor, as if you had typed it.
+ * Returns FALSE if we can't do that safely (then the caller opens the file normally).
+ *
+ *   vim   Ctrl-\ Ctrl-N goes to normal mode from ANY mode (and from a half-typed ":").
+ *         `:update | edit FILE`  writes only if there are changes. If writing fails (read-only
+ *         file, no name) vim stops at the error and does NOT switch: nothing gets lost.
+ *   nano  Ctrl-O Enter writes the buffer; Ctrl-R opens "insert file", Alt-F in that prompt
+ *         means "into a new buffer" (switch between buffers with Alt-< and Alt->).
+ */
+static gboolean
+editor_open_file(State *st, Foreground fg, const char *path)
+{
+	for (const char *c = path; *c; c++)
+		if ((unsigned char)*c < 0x20 || *c == 0x7f) return FALSE;   /* would be typed as keys */
+
+	GString *keys = g_string_new(NULL);
+	if (fg == FG_VIM) {
+		char *esc = vim_escape(path);
+		g_string_append_printf(keys, "\034\016:update | edit %s\r", esc);
+		g_free(esc);
+	} else if (fg == FG_NANO) {
+		g_string_append_printf(keys, "\017\r\022\033f%s\r", path);
+	} else {
+		g_string_free(keys, TRUE);
+		return FALSE;
+	}
+	type_into_terminal(st, keys->str);
+	g_string_free(keys, TRUE);
+	gtk_widget_grab_focus(st->terminal);   /* you will want to keep typing in the editor */
+	return TRUE;
+}
+
 /*
  * Enter (or double click) on a row of the file list.
  * GtkListView emits "activate" with the row number ("position").
  *   - directory -> make the terminal cd into it (the list follows by itself,
  *                  through on_cwd_changed, once the next prompt appears)
+ *   - text file while vim / nano is open -> save, and continue in that file
  *   - file      -> open it with the default application
  */
 static void
@@ -951,21 +1028,25 @@ on_row_activated(GtkListView *view, guint position, gpointer user_data)
 				g_free(path);
 			}
 		} else {
-			char *uri = g_file_get_uri(file);
-			GError *error = NULL;
-			if (!g_app_info_launch_default_for_uri(uri, NULL, &error)) {
-				g_printerr("could not open %s: %s\n", uri, error->message);
-				g_clear_error(&error);
+			Foreground fg = foreground_kind(st);
+			char *path = (fg == FG_VIM || fg == FG_NANO) && is_text_file(file) ? g_file_get_path(file) : NULL;
+			if (path && editor_open_file(st, fg, path)) {
+				/* done: the editor took over */
+			} else {
+				char *uri = g_file_get_uri(file);
+				GError *error = NULL;
+				if (!g_app_info_launch_default_for_uri(uri, NULL, &error)) {
+					g_printerr("could not open %s: %s\n", uri, error->message);
+					g_clear_error(&error);
+				}
+				g_free(uri);
 			}
-			g_free(uri);
+			g_free(path);
 		}
 	}
 
 	g_object_unref(info);
 }
-
-/* Who is in front of the terminal right now? */
-typedef enum { FG_OTHER, FG_SHELL, FG_VIM, FG_NANO, FG_PYTHON } Foreground;
 
 static Foreground
 foreground_kind(State *st)
@@ -1855,7 +1936,7 @@ build_cheat_page(State *st, GtkWidget *stack)
 		{ "Shift + ←", "Move to the file list" },
 		{ "Shift + →", "Move to the terminal" },
 		{ "↑  ↓", "Move through the files (file list)" },
-		{ "Enter", "Open the file, or cd into the folder; your typed command is kept (file list)" },
+		{ "Enter", "Open the file, or cd into the folder; your typed command is kept. In vim / nano a text file is opened there instead, after saving the current one (file list)" },
 		{ "→ / ←", "Open / close the highlighted folder in place (file list)" },
 		{ "Backspace", "Go up one folder (cd ..) (file list)" },
 		{ "Shift + Enter", "Paste the file's path into the terminal: quoted for the shell, plain in vim / nano, a string in python (file list)" },

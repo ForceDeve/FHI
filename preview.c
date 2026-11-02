@@ -501,6 +501,7 @@ is_wrapper(const char *cmd)
 {
 	static const char *const wrappers[] = {
 		"sudo", "doas", "command", "builtin", "exec", "nohup", "time", "env", "nice", "noglob",
+		"fakeroot", "fakeroot-sysv", "ionice",
 	};
 	for (guint i = 0; i < G_N_ELEMENTS(wrappers); i++)
 		if (strcmp(cmd, wrappers[i]) == 0) return TRUE;
@@ -595,6 +596,268 @@ git_scan(Ctx *ctx, GPtrArray *words, guint from)
 	}
 }
 
+/* ---- build tools and packaging ------------------------------------------ */
+
+/*
+ * `make` does not name Makefile, `makepkg` does not name PKGBUILD, `cargo build` does
+ * not name Cargo.toml, but those are the files the command is about to read, and it
+ * may create or delete folders (build/, target/, src/ pkg/ ...). This table says which.
+ *
+ *   inputs   files that are read (shown as "touched"). Space separated; a|b|c means
+ *            "the first one that exists" (like make picking GNUmakefile before Makefile).
+ *   outputs  names that get written (shown as "created", ghosts if they are not there yet).
+ *   removes  names that get deleted (only if they exist).
+ *   skip     if one of these options is given the command works somewhere else
+ *            (make -C dir, cmake --build dir ...), so the inputs are not in this folder.
+ *
+ * `sub` is the sub-command (`cargo build`); NULL means the rule applies to any.
+ */
+typedef struct {
+	const char *cmd, *sub;
+	const char *inputs, *outputs, *removes, *skip;
+} BuildRule;
+
+#define MAKEFILES "GNUmakefile|makefile|Makefile"
+#define COMPOSE "compose.yaml|compose.yml|docker-compose.yaml|docker-compose.yml"
+#define GRADLE "build.gradle|build.gradle.kts settings.gradle|settings.gradle.kts"
+
+static const BuildRule build_rules[] = {
+	{ "make",  NULL, MAKEFILES, NULL, NULL, "-C -f --directory --file --makefile" },
+	{ "gmake", NULL, MAKEFILES, NULL, NULL, "-C -f --directory --file --makefile" },
+	{ "ninja", NULL, "build.ninja", NULL, NULL, "-C -f" },
+	{ "cmake", NULL, "CMakeLists.txt CMakePresets.json CMakeUserPresets.json CMakeCache.txt", NULL, NULL,
+	  "--build --install --open -E -P --workflow" },
+	{ "ctest", NULL, "CTestTestfile.cmake", NULL, NULL, "--test-dir" },
+	{ "meson", "setup",   "meson.build meson.options meson_options.txt", NULL, NULL, NULL },
+	{ "meson", "compile", "meson.build", NULL, NULL, "-C" },
+	{ "just",  NULL, "justfile|Justfile|.justfile", NULL, NULL, "-f --justfile" },
+
+	/* packaging */
+	{ "makepkg",     NULL, "PKGBUILD", "src pkg", NULL, "-p" },
+	{ "updpkgsums",  NULL, "PKGBUILD", NULL, NULL, NULL },
+	{ "dpkg-buildpackage", NULL, "debian", NULL, NULL, NULL },
+	{ "debuild",     NULL, "debian", NULL, NULL, NULL },
+	{ "dh_make",     NULL, NULL, "debian", NULL, NULL },
+	{ "docker",      "build",   "Dockerfile|Containerfile .dockerignore", NULL, NULL, "-f --file" },
+	{ "podman",      "build",   "Containerfile|Dockerfile .dockerignore", NULL, NULL, "-f --file" },
+	{ "docker",      "compose", COMPOSE, NULL, NULL, "-f --file" },
+	{ "docker-compose", NULL,   COMPOSE, NULL, NULL, "-f --file" },
+
+	/* language build tools */
+	{ "cargo", "build", "Cargo.toml Cargo.lock", "target", NULL, "--manifest-path" },
+	{ "cargo", "run",   "Cargo.toml Cargo.lock", "target", NULL, "--manifest-path" },
+	{ "cargo", "test",  "Cargo.toml Cargo.lock", "target", NULL, "--manifest-path" },
+	{ "cargo", "check", "Cargo.toml Cargo.lock", "target", NULL, "--manifest-path" },
+	{ "cargo", "clean", "Cargo.toml", NULL, "target", "--manifest-path" },
+	{ "go",    "build", "go.mod go.sum", NULL, NULL, NULL },
+	{ "go",    "run",   "go.mod go.sum", NULL, NULL, NULL },
+	{ "go",    "test",  "go.mod go.sum", NULL, NULL, NULL },
+	{ "go",    "mod",   "go.mod go.sum", NULL, NULL, NULL },
+	{ "npm",   "install", "package.json package-lock.json", "node_modules", NULL, "--prefix" },
+	{ "npm",   "i",       "package.json package-lock.json", "node_modules", NULL, "--prefix" },
+	{ "npm",   "ci",      "package.json package-lock.json", "node_modules", NULL, "--prefix" },
+	{ "npm",   "run",     "package.json", NULL, NULL, "--prefix" },
+	{ "npm",   "test",    "package.json", NULL, NULL, "--prefix" },
+	{ "npm",   "start",   "package.json", NULL, NULL, "--prefix" },
+	{ "pnpm",  "install", "package.json pnpm-lock.yaml", "node_modules", NULL, "--dir" },
+	{ "yarn",  "install", "package.json yarn.lock", "node_modules", NULL, "--cwd" },
+	{ "mvn",   NULL, "pom.xml", "target", NULL, "-f --file" },
+	{ "gradle",  NULL, GRADLE, "build", NULL, "-p --project-dir" },
+	{ "gradlew", NULL, GRADLE, "build", NULL, "-p --project-dir" },
+};
+
+/* Is `opt` (as typed: "-C", "-Cdir", "--directory=dir") one of the options in the
+ * space separated `list`? */
+static gboolean
+option_listed(const char *list, const char *opt)
+{
+	gboolean found = FALSE;
+	char **v = g_strsplit(list, " ", -1);
+	for (char **w = v; *w && !found; w++) {
+		gsize n = strlen(*w);
+		if (strcmp(opt, *w) == 0) found = TRUE;
+		else if ((*w)[1] == '-') found = strncmp(opt, *w, n) == 0 && opt[n] == '=';   /* --long=value */
+		else found = strncmp(opt, *w, n) == 0 && opt[1] != '-';                       /* -Cvalue */
+	}
+	g_strfreev(v);
+	return found;
+}
+
+/* ---- PKGBUILD: what package file will makepkg produce? ---- */
+
+/* Words of `key=value` or `key=(a b 'c d')` in a PKGBUILD. Values that run code are left out. */
+static GPtrArray *
+pkgbuild_values(const char *text, const char *key)
+{
+	GPtrArray *out = g_ptr_array_new_with_free_func(g_free);
+	char *needle = g_strdup_printf("%s=", key);
+	const char *p = text;
+	while ((p = strstr(p, needle)) != NULL) {
+		if (p != text && p[-1] != '\n') { p += strlen(needle); continue; }   /* not at line start */
+		p += strlen(needle);
+		gboolean array = *p == '(';
+		if (array) p++;
+		GString *w = g_string_new(NULL);
+		char quote = 0;
+		gboolean has_word = FALSE;
+		for (; *p; p++) {
+			if (quote) {
+				if (*p == quote) quote = 0; else g_string_append_c(w, *p);
+			} else if (*p == '\'' || *p == '"') {
+				quote = *p; has_word = TRUE;
+			} else if (*p == '#' && !has_word && w->len == 0) {
+				while (p[1] && p[1] != '\n') p++;              /* comment */
+			} else if (g_ascii_isspace(*p) || (array && *p == ')')) {
+				if (has_word || w->len) {
+					if (!strstr(w->str, "$(") && !strchr(w->str, '`'))
+						g_ptr_array_add(out, g_strdup(w->str));
+					g_string_truncate(w, 0);
+					has_word = FALSE;
+				}
+				if (array ? *p == ')' : *p == '\n') break;
+			} else {
+				g_string_append_c(w, *p);
+			}
+		}
+		if (has_word || w->len) g_ptr_array_add(out, g_strdup(w->str));
+		g_string_free(w, TRUE);
+		break;   /* the first assignment is the one that counts */
+	}
+	g_free(needle);
+	return out;
+}
+
+/* Replace $pkgname ${pkgver} ... in a source=() entry. NULL if something unknown is left. */
+static char *
+pkgbuild_expand(const char *s, const char *name, const char *ver, const char *rel)
+{
+	static const char *const keys[] = { "pkgname", "pkgver", "pkgrel" };
+	const char *vals[] = { name, ver, rel };
+	GString *out = g_string_new(NULL);
+	for (const char *c = s; *c; c++) {
+		if (*c != '$') { g_string_append_c(out, *c); continue; }
+		const char *v = c + 1;
+		gboolean brace = *v == '{';
+		if (brace) v++;
+		gboolean ok = FALSE;
+		for (guint i = 0; i < 3 && !ok; i++) {
+			gsize n = strlen(keys[i]);
+			if (strncmp(v, keys[i], n) == 0 && (!brace || v[n] == '}') && vals[i]) {
+				g_string_append(out, vals[i]);
+				c = v + n - 1 + (brace ? 1 : 0);
+				ok = TRUE;
+			}
+		}
+		if (!ok) { g_string_free(out, TRUE); return NULL; }
+	}
+	return g_string_free(out, FALSE);
+}
+
+/* makepkg: the package file(s) it will write, and the local source files it reads */
+static void
+pkgbuild_preview(Ctx *ctx)
+{
+	char *path = g_build_filename(ctx->cwd, "PKGBUILD", NULL);
+	char *text = NULL;
+	gsize len = 0;
+	gboolean ok = g_file_get_contents(path, &text, &len, NULL) && len <= 1024 * 1024;
+	g_free(path);
+	if (!ok) { g_free(text); return; }
+
+	GPtrArray *names = pkgbuild_values(text, "pkgname");
+	GPtrArray *ver = pkgbuild_values(text, "pkgver");
+	GPtrArray *rel = pkgbuild_values(text, "pkgrel");
+	GPtrArray *arch = pkgbuild_values(text, "arch");
+	GPtrArray *src = pkgbuild_values(text, "source");
+	const char *v = ver->len ? ver->pdata[0] : NULL, *r = rel->len ? rel->pdata[0] : NULL;
+
+	/* "any" if the package says so, else the machine we build on if it is allowed, else the first */
+	const char *machine = "x86_64";
+#ifdef __aarch64__
+	machine = "aarch64";
+#endif
+	const char *a = arch->len ? arch->pdata[0] : NULL;
+	for (guint i = 0; i < arch->len; i++) {
+		if (strcmp(arch->pdata[i], "any") == 0) { a = "any"; break; }
+		if (strcmp(arch->pdata[i], machine) == 0) a = machine;
+	}
+
+	if (v && r && a && !strchr(v, '$')) {
+		for (guint i = 0; i < names->len; i++) {
+			const char *n = names->pdata[i];
+			if (strchr(n, '$') || strchr(n, '/')) continue;
+			char *pkg = g_strdup_printf("%s-%s-%s-%s.pkg.tar.zst", n, v, r, a);
+			add_hit(ctx, pkg, FHI_ROLE_CREATE);
+			g_free(pkg);
+		}
+	}
+	for (guint i = 0; i < src->len; i++) {
+		const char *e = src->pdata[i];
+		if (strstr(e, "://") || strstr(e, "::")) continue;               /* downloaded, not local */
+		char *file = pkgbuild_expand(e, names->len ? names->pdata[0] : NULL, v, r);
+		if (file && !strchr(file, '/') && g_hash_table_contains(ctx->existing, file))
+			add_hit(ctx, file, FHI_ROLE_TOUCH);
+		g_free(file);
+	}
+	g_ptr_array_unref(names); g_ptr_array_unref(ver); g_ptr_array_unref(rel);
+	g_ptr_array_unref(arch); g_ptr_array_unref(src);
+	g_free(text);
+}
+
+/*
+ * `cmd` is the command name, `args` its words without options, `opts` its options
+ * (plain strings). The sub-command is the first word (`cargo build`).
+ */
+static void
+build_preview(Ctx *ctx, const char *cmd, GPtrArray *args, GPtrArray *opts)
+{
+	const char *sub = NULL;
+	if (args->len > 0 && !((const Token *)args->pdata[0])->unknown)
+		sub = ((const Token *)args->pdata[0])->pattern;
+
+	/* building another folder ("cmake ..", "make -C x"): its files are not in this list */
+	gboolean elsewhere = FALSE;
+	for (guint i = 0; i < args->len; i++) {
+		const char *a = ((const Token *)args->pdata[i])->pattern;
+		if (strcmp(a, "..") == 0 || g_str_has_prefix(a, "../")) elsewhere = TRUE;
+	}
+
+	for (guint r = 0; r < G_N_ELEMENTS(build_rules); r++) {
+		const BuildRule *br = &build_rules[r];
+		if (strcmp(br->cmd, cmd) != 0) continue;
+		if (br->sub && (sub == NULL || strcmp(br->sub, sub) != 0)) continue;
+
+		gboolean skip = elsewhere;
+		for (guint i = 0; br->skip && i < opts->len && !skip; i++)
+			skip = option_listed(br->skip, opts->pdata[i]);
+		if (skip) return;
+
+		if (br->inputs) {
+			char **groups = g_strsplit(br->inputs, " ", -1);
+			for (char **g = groups; *g; g++) {
+				char **alts = g_strsplit(*g, "|", -1);
+				for (char **al = alts; *al; al++)
+					if (g_hash_table_contains(ctx->existing, *al)) { add_hit(ctx, *al, FHI_ROLE_TOUCH); break; }
+				g_strfreev(alts);
+			}
+			g_strfreev(groups);
+		}
+		if (strcmp(cmd, "makepkg") == 0) pkgbuild_preview(ctx);
+		if (br->outputs) {
+			char **v = g_strsplit(br->outputs, " ", -1);
+			for (char **o = v; *o; o++) add_hit(ctx, *o, FHI_ROLE_CREATE);
+			g_strfreev(v);
+		}
+		if (br->removes) {
+			char **v = g_strsplit(br->removes, " ", -1);
+			for (char **o = v; *o; o++)
+				if (g_hash_table_contains(ctx->existing, *o)) add_hit(ctx, *o, FHI_ROLE_REMOVE);
+			g_strfreev(v);
+		}
+		return;
+	}
+}
+
 /* `words` holds the Token*s of ONE simple command, redirections excluded. */
 static void
 analyze(Ctx *ctx, GPtrArray *words)
@@ -623,8 +886,11 @@ analyze(Ctx *ctx, GPtrArray *words)
 	gboolean unknown_cmd = ((const Token *)words->pdata[i])->unknown;
 	Kind kind = unknown_cmd ? KIND_GENERIC : classify(cmd);
 	if (!unknown_cmd && strcmp(cmd, "git") == 0) git_scan(ctx, words, i + 1);
-	g_free(cmd);
+	/* `./build.sh`: the script you are about to run is in this list too */
+	if (!unknown_cmd && g_str_has_prefix(((const Token *)words->pdata[i])->pattern, "./"))
+		add_word(ctx, words->pdata[i], FHI_ROLE_TOUCH, FHI_ROLE_NONE);
 	i++;
+	GPtrArray *opts = g_ptr_array_new();   /* the -options, as plain strings */
 
 	/* collect the arguments, dropping -options (and everything is an argument after "--") */
 	GPtrArray *args = g_ptr_array_new();   /* does not own the tokens */
@@ -634,6 +900,7 @@ analyze(Ctx *ctx, GPtrArray *words)
 		const Token *t = words->pdata[i];
 		if (!options_done && strcmp(t->pattern, "--") == 0) { options_done = TRUE; continue; }
 		if (!options_done && is_option(t)) {
+			g_ptr_array_add(opts, t->pattern);
 			if (kind == KIND_MOVE && i + 1 < words->len &&
 			    (strcmp(t->pattern, "-t") == 0 || strcmp(t->pattern, "--target-directory") == 0))
 				target_dir = words->pdata[++i];
@@ -667,7 +934,10 @@ analyze(Ctx *ctx, GPtrArray *words)
 		for (guint k = 0; k < args->len; k++) add_word(ctx, args->pdata[k], FHI_ROLE_TOUCH, FHI_ROLE_NONE);
 		break;
 	}
+	if (!unknown_cmd && kind == KIND_GENERIC) build_preview(ctx, cmd, args, opts);
+	g_ptr_array_unref(opts);
 	g_ptr_array_unref(args);
+	g_free(cmd);
 }
 
 static gint
