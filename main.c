@@ -210,6 +210,38 @@ refresh_all_rows(State *st)
 	while (g_hash_table_iter_next(&it, &box, NULL)) apply_row_style(st, box);
 }
 
+/*
+ * Dragging a row out of the window (to a browser, Discord, a file manager...).
+ * We offer the file as a GdkFileList, which GTK turns into the standard
+ * "text/uri-list" other apps understand. The row widget is reused for different
+ * files, so we look up which file it shows at the moment the drag starts.
+ */
+static GdkContentProvider *
+on_drag_prepare(GtkDragSource *source, double x, double y, gpointer user_data)
+{
+	GtkWidget *box = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(source));
+	GFileInfo *info = g_object_get_data(G_OBJECT(box), "fhi-info");
+	if (info == NULL || g_file_info_get_attribute_boolean(info, "fhi::ghost")) return NULL;   /* nothing to drag */
+	GFile *file = G_FILE(g_file_info_get_attribute_object(info, "standard::file"));
+	if (file == NULL) return NULL;
+
+	GFile *files[1] = { file };
+	GdkFileList *list = gdk_file_list_new_from_array(files, 1);
+	GdkContentProvider *provider = gdk_content_provider_new_typed(GDK_TYPE_FILE_LIST, list);
+	g_object_unref(list);
+	return provider;
+}
+
+/* While dragging, the pointer carries a picture of the row */
+static void
+on_drag_begin(GtkDragSource *source, GdkDrag *drag, gpointer user_data)
+{
+	GtkWidget *box = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(source));
+	GdkPaintable *paintable = gtk_widget_paintable_new(box);
+	gtk_drag_source_set_icon(source, paintable, 0, 0);
+	g_object_unref(paintable);
+}
+
 /* "setup": GTK needs an empty row. Called once per row WIDGET (they get reused). */
 static void
 setup_item(GtkSignalListItemFactory *factory, GtkListItem *item, gpointer user_data)
@@ -222,6 +254,13 @@ setup_item(GtkSignalListItemFactory *factory, GtkListItem *item, gpointer user_d
 	gtk_widget_add_css_class(box, "fhi-row");
 	gtk_box_append(GTK_BOX(box), icon);
 	gtk_box_append(GTK_BOX(box), label);
+
+	GtkDragSource *drag = gtk_drag_source_new();
+	gtk_drag_source_set_actions(drag, GDK_ACTION_COPY);   /* never move or delete the original */
+	g_signal_connect(drag, "prepare", G_CALLBACK(on_drag_prepare), NULL);
+	g_signal_connect(drag, "drag-begin", G_CALLBACK(on_drag_begin), NULL);
+	gtk_widget_add_controller(box, GTK_EVENT_CONTROLLER(drag));
+
 	gtk_list_item_set_child(item, box);
 }
 
@@ -1765,6 +1804,7 @@ build_cheat_page(State *st, GtkWidget *stack)
 		{ "Backspace", "Go up one folder (cd ..) (file list)" },
 		{ "Shift + Enter", "Paste the file's path into the terminal: quoted for the shell, plain in vim / nano, a string in python (file list)" },
 		{ "Double click", "Same as Enter" },
+		{ "Drag a file", "Drop it into a browser, Discord, a file manager... (copies it)" },
 		{ "Shift + ↑ / ↓", "Next / previous sort mode (file list)" },
 		{ "Ctrl + R", "Reverse the sort order (file list)" },
 		{ "Just type", "Filter the list with shell patterns: *.png  {a,b}*  !*.o  (file list)" },
