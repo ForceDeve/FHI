@@ -14,20 +14,8 @@
 #include "filetype.h"
 #include "gitinfo.h"
 #include "sshinfo.h"
+#include "theme.h"
 #include <strings.h>
-
-/* Indexes into Settings.col */
-enum { C_TOUCH, C_CREATE, C_DEST, C_REMOVE, C_TERM_BG, C_TERM_FG, C_COUNT };
-static const char *const color_default[C_COUNT] = {
-	"#e5a50a", "#26a269", "#3584e4", "#e01b24", "#1e1e1e", "#d0d0d0"
-};
-static const char *const color_key[C_COUNT] = {
-	"touch", "create", "dest", "remove", "term_bg", "term_fg"
-};
-static const char *const color_label[C_COUNT] = {
-	"Mentioned file", "Created file", "Destination", "Removed file",
-	"Terminal background", "Terminal text"
-};
 
 /* Sort modes. For size / dates the "normal" direction is largest / newest first. */
 enum { SORT_NAME, SORT_SIZE, SORT_MODIFIED, SORT_CREATED, SORT_TYPE, SORT_COUNT };
@@ -40,9 +28,7 @@ static const char *const sort_dir_text[SORT_COUNT][2] = {
 
 /* Everything the hamburger menu can change. Saved in ~/.config/fhi/settings.ini */
 typedef struct {
-	int scheme;                 /* 0 = follow system, 1 = light, 2 = dark */
-	GdkRGBA col[C_COUNT];
-	gboolean custom_term;       /* use col[C_TERM_*] instead of VTE's defaults */
+	FhiTheme theme;             /* colors, scheme, corners, opacity (see theme.h) */
 	gboolean show_hidden;       /* list files starting with "." */
 	gboolean info_type, info_size, info_created, info_accessed;
 	gboolean info_wrap;         /* wrap the info bar instead of cutting it off */
@@ -95,9 +81,22 @@ typedef struct {
 	GtkWidget *ssh_card;             /* session info, over the dimmed panel */
 	GtkWidget *last_pane;            /* list or terminal: where focus goes after the menu closes */
 	GtkWidget *font_btn;             /* terminal font chooser */
-	GtkWidget *scheme_dd;            /* theme page widgets, kept so "Reset" can update them */
-	GtkWidget *color_btn[C_COUNT];
-	GtkWidget *term_switch;
+	/* theme page widgets, kept so they can follow the settings (see theme_sync_widgets) */
+	GtkWidget *scheme_dd;
+	GtkWidget *theme_dd;
+	GtkWidget *opt_btn[TC_COUNT];    /* one color button per theme color */
+	GtkWidget *opt_clear[TC_COUNT];  /* "follow the system" button next to it (NULL if none) */
+	GtkWidget *pal_switch, *pal_box, *pal_btn[FHI_PALETTE_SIZE];
+	GtkWidget *radius_scale, *radius_clear, *opacity_scale;
+	GtkWidget *radius_label, *opacity_label;   /* "Corners 12 px", "Opacity 85%" */
+	GtkWidget *theme_entry;          /* name for "Save as theme" */
+	GtkStringList *theme_names;      /* what theme_dd shows */
+	GPtrArray *themes;               /* FhiThemeInfo*, same order as theme_names (after "Default") */
+	char *theme_id;                  /* the theme chosen in theme_dd, NULL = none */
+	gboolean syncing;                /* TRUE while we set widgets ourselves: their signals are ignored */
+	guint save_timer;                /* pending save_settings() after a slider moved */
+	GtkCssProvider *user_css;        /* ~/.config/fhi/user.css, loaded last */
+	GFileMonitor *user_css_mon;      /* reloads it when it is saved */
 
 	/* --- sorting and filtering --- */
 	GtkSorter *sorter;
@@ -1330,9 +1329,7 @@ on_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode,
 static void
 settings_defaults(Settings *c)
 {
-	c->scheme = 0;
-	for (int i = 0; i < C_COUNT; i++) gdk_rgba_parse(&c->col[i], color_default[i]);
-	c->custom_term = FALSE;
+	fhi_theme_init(&c->theme);
 	c->show_hidden = TRUE;
 	c->info_type = c->info_size = c->info_created = c->info_accessed = TRUE;
 	c->info_wrap = FALSE;
@@ -1362,19 +1359,21 @@ load_settings(State *st)
 	GKeyFile *kf = g_key_file_new();
 	char *path = settings_path();
 	if (g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL)) {
-		if (g_key_file_has_key(kf, "fhi", "scheme", NULL))
-			c->scheme = CLAMP(g_key_file_get_integer(kf, "fhi", "scheme", NULL), 0, 2);
 		if (g_key_file_has_key(kf, "fhi", "info_font", NULL))
 			c->info_font = CLAMP(g_key_file_get_integer(kf, "fhi", "info_font", NULL), 6, 32);
-		for (int i = 0; i < C_COUNT; i++) {
-			char *v = g_key_file_get_string(kf, "fhi", color_key[i], NULL);
-			if (v) gdk_rgba_parse(&c->col[i], v);
-			g_free(v);
-		}
+		/* The theme: colors, scheme ("system" / "light" / "dark", or the 0 / 1 / 2 older versions
+		 * wrote), corners, opacity. */
+		fhi_theme_load_group(&c->theme, kf, "fhi");
+		/* Older versions always wrote the terminal colors and a switch for whether to use them */
+		if (g_key_file_has_key(kf, "fhi", "custom_term", NULL) &&
+		    !g_key_file_get_boolean(kf, "fhi", "custom_term", NULL))
+			c->theme.set[TC_TERM_BG] = c->theme.set[TC_TERM_FG] = FALSE;
+		g_free(st->theme_id);
+		st->theme_id = g_key_file_get_string(kf, "fhi", "theme", NULL);
+		if (st->theme_id && !*st->theme_id) g_clear_pointer(&st->theme_id, g_free);
 		g_free(c->term_font);
 		c->term_font = g_key_file_get_string(kf, "fhi", "term_font", NULL);
 		if (c->term_font && !*c->term_font) g_clear_pointer(&c->term_font, g_free);
-		kf_get_bool(kf, "custom_term", &c->custom_term);
 		kf_get_bool(kf, "show_hidden", &c->show_hidden);
 		kf_get_bool(kf, "info_type", &c->info_type);
 		kf_get_bool(kf, "info_size", &c->info_size);
@@ -1395,15 +1394,10 @@ save_settings(State *st)
 {
 	Settings *c = &st->cfg;
 	GKeyFile *kf = g_key_file_new();
-	g_key_file_set_integer(kf, "fhi", "scheme", c->scheme);
 	g_key_file_set_integer(kf, "fhi", "info_font", c->info_font);
-	for (int i = 0; i < C_COUNT; i++) {
-		char *v = gdk_rgba_to_string(&c->col[i]);
-		g_key_file_set_string(kf, "fhi", color_key[i], v);
-		g_free(v);
-	}
+	fhi_theme_save_group(&c->theme, kf, "fhi");
+	if (st->theme_id) g_key_file_set_string(kf, "fhi", "theme", st->theme_id);
 	if (c->term_font) g_key_file_set_string(kf, "fhi", "term_font", c->term_font);
-	g_key_file_set_boolean(kf, "fhi", "custom_term", c->custom_term);
 	g_key_file_set_boolean(kf, "fhi", "show_hidden", c->show_hidden);
 	g_key_file_set_boolean(kf, "fhi", "info_type", c->info_type);
 	g_key_file_set_boolean(kf, "fhi", "info_size", c->info_size);
@@ -1611,19 +1605,60 @@ rgb_css(const GdkRGBA *c)
 	return gdk_rgba_to_string(&o);
 }
 
-/* Push every setting to the UI. `save` is FALSE only for the first call at startup. */
+/* ---- colors: everything the theme decides ----------------------------- */
+
+static gboolean
+display_composited(void)
+{
+	return gdk_display_is_composited(gdk_display_get_default());
+}
+
+/*
+ * The terminal's colors. With nothing set this is exactly what FHI always did: VTE's
+ * own defaults. Transparency is the only thing that needs an explicit background, because
+ * the alpha lives in it.
+ */
 static void
-apply_all(State *st, gboolean save)
+apply_terminal_theme(State *st)
+{
+	VteTerminal *term = VTE_TERMINAL(st->terminal);
+	const FhiTheme *t = &st->cfg.theme;
+
+	vte_terminal_set_default_colors(term);   /* also resets palette, cursor */
+
+	GdkRGBA bg;
+	const GdkRGBA *bgp = NULL, *fgp = t->set[TC_TERM_FG] ? &t->col[TC_TERM_FG] : NULL;
+	if (t->set[TC_TERM_BG]) { bg = t->col[TC_TERM_BG]; bgp = &bg; }
+	if (fhi_theme_is_transparent(t, display_composited())) {
+		if (bgp == NULL) {   /* keep VTE's own background, only make it see-through */
+			vte_terminal_get_color_background_for_draw(term, &bg);
+			bgp = &bg;
+		}
+		bg.alpha = t->opacity / 100.0;
+	}
+
+	if (t->has_palette)
+		vte_terminal_set_colors(term, fgp, bgp, t->palette, FHI_PALETTE_SIZE);
+	else if (fgp)
+		vte_terminal_set_color_foreground(term, fgp);
+	/* Set on its own as well: this is the call that carries the alpha for sure */
+	if (bgp) vte_terminal_set_color_background(term, bgp);
+	if (t->set[TC_CURSOR]) vte_terminal_set_color_cursor(term, &t->col[TC_CURSOR]);
+}
+
+/* Light / dark, the style sheet (FHI's own rules, then the theme's) and the terminal colors */
+static void
+apply_theme(State *st)
 {
 	Settings *c = &st->cfg;
+	FhiTheme *t = &c->theme;
 
-	/* light / dark */
-	gboolean dark = c->scheme == 0 ? st->system_dark : c->scheme == 2;
-	g_object_set(gtk_settings_get_default(), "gtk-application-prefer-dark-theme", dark, NULL);
+	g_object_set(gtk_settings_get_default(), "gtk-application-prefer-dark-theme",
+	             fhi_theme_is_dark(t, st->system_dark), NULL);
 
 	/* style sheet: row highlight colors + info bar font */
 	char *col[4];
-	for (int i = 0; i < 4; i++) col[i] = rgb_css(&c->col[i]);
+	for (int i = 0; i < 4; i++) col[i] = rgb_css(&t->col[TC_TOUCH + i]);
 	char *css = g_strdup_printf(
 	    ".fhi-row    { padding: 2px 6px; border-radius: 4px; }"
 	    ".fhi-touch  { background: alpha(%s, 0.30); }"
@@ -1642,25 +1677,54 @@ apply_all(State *st, gboolean save)
 	    ".fhi-top    { padding: 4px; }"
 	    ".fhi-unsupported { background: alpha(@theme_bg_color, 0.95); font-weight: bold; padding: 8px 12px; border-radius: 6px; }"
 	    ".fhi-dim    { opacity: 0.35; }"
-	    ".fhi-sshcard { background: alpha(@theme_bg_color, 0.96); padding: 12px 16px; border-radius: 8px;"
+	    ".fhi-sshcard { background: alpha(@theme_bg_color, 0.985); padding: 12px 16px; border-radius: 8px;"
 	    "               border: 1px solid alpha(currentColor, 0.25); box-shadow: 0 4px 16px alpha(black, 0.35); }"
+	    ".fhi-sshnarrow { padding: 8px 10px; }"
 	    ".fhi-sshtitle { font-weight: bold; font-size: 12pt; }"
 	    ".fhi-square, .fhi-square > border, .fhi-square scrolledwindow { border-radius: 0; }"
 	    ".fhi-sort   { font-size: 8pt; opacity: 0.5; padding: 4px 8px; }"
 	    ".fhi-swatch { min-width: 14px; min-height: 14px; border-radius: 3px; }",
 	    col[0], col[1], col[2], col[3], c->info_font);
-	gtk_css_provider_load_from_data(st->css, css, -1);
+	gboolean composited = display_composited();
+	char *themecss = fhi_theme_css(t, composited);   /* after ours: same rule, last one wins */
+	char *all = g_strconcat(css, themecss, NULL);
+	gtk_css_provider_load_from_data(st->css, all, -1);
+	g_free(all);
+	g_free(themecss);
 	g_free(css);
 	for (int i = 0; i < 4; i++) g_free(col[i]);
 
-	/* terminal colors */
+	/* The class is only there while the window really is see-through */
+	if (fhi_theme_is_transparent(t, composited)) gtk_widget_add_css_class(st->window, "fhi-transparent");
+	else gtk_widget_remove_css_class(st->window, "fhi-transparent");
+
+	apply_terminal_theme(st);
+}
+
+/* A slider moved many times a second: apply at once, write the file once it settles */
+static gboolean
+save_later(gpointer user_data)
+{
+	State *st = user_data;
+	st->save_timer = 0;
+	save_settings(st);
+	return G_SOURCE_REMOVE;
+}
+
+static void
+queue_save(State *st)
+{
+	if (st->save_timer) g_source_remove(st->save_timer);
+	st->save_timer = g_timeout_add(400, save_later, st);
+}
+
+/* Push every setting to the UI. `save` is FALSE only for the first call at startup. */
+static void
+apply_all(State *st, gboolean save)
+{
+	Settings *c = &st->cfg;
 	VteTerminal *term = VTE_TERMINAL(st->terminal);
-	if (c->custom_term) {
-		vte_terminal_set_color_background(term, &c->col[C_TERM_BG]);
-		vte_terminal_set_color_foreground(term, &c->col[C_TERM_FG]);
-	} else {
-		vte_terminal_set_default_colors(term);
-	}
+	apply_theme(st);
 
 	/* terminal font: the user's own choice if there is one, else plain Monospace.
 	 * Either way the bundled Nerd Font is the last family, so icons in prompts
@@ -1777,28 +1841,114 @@ sub_page(GtkWidget *stack, const char *title)
 	return page;
 }
 
+/* ---- the theme page: keeping the widgets and the settings in step ------- */
+
+/* What an unset ("follow the system") color button shows: roughly the system's color */
 static void
-on_color_set(GtkColorButton *button, gpointer user_data)
+fallback_color(State *st, int idx, GdkRGBA *out)
+{
+	static const char *const light[] = { "#f6f5f4", "#2e3436", "#ffffff", "#3584e4", "#ffffff", "#2e3436", "#2e3436" };
+	static const char *const dark[]  = { "#242424", "#ffffff", "#1e1e1e", "#3584e4", "#1e1e1e", "#d0d0d0", "#d0d0d0" };
+	gboolean is_dark = fhi_theme_is_dark(&st->cfg.theme, st->system_dark);
+	gdk_rgba_parse(out, idx < TC_TOUCH ? (is_dark ? dark : light)[idx] : "#808080");
+}
+
+/* The numbers next to the two sliders (the sliders themselves show no value: it would sit on the knob) */
+static void
+theme_sync_labels(State *st)
+{
+	const FhiTheme *t = &st->cfg.theme;
+	char *r = t->radius >= 0 ? g_strdup_printf("Corners  %d px", t->radius) : g_strdup("Corners  (system)");
+	char *o = g_strdup_printf("Opacity  %d%%", t->opacity);
+	gtk_label_set_text(GTK_LABEL(st->radius_label), r);
+	gtk_label_set_text(GTK_LABEL(st->opacity_label), o);
+	g_free(r);
+	g_free(o);
+}
+
+/* Make every widget of the page show the current settings. Their signals are ignored meanwhile. */
+static void
+theme_sync_widgets(State *st)
+{
+	const FhiTheme *t = &st->cfg.theme;
+	st->syncing = TRUE;
+
+	gtk_drop_down_set_selected(GTK_DROP_DOWN(st->scheme_dd), CLAMP(t->scheme, 0, 2));
+	for (int i = 0; i < TC_COUNT; i++) {
+		GdkRGBA c = t->col[i];
+		if (!t->set[i]) fallback_color(st, i, &c);
+		gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(st->opt_btn[i]), &c);
+		gtk_widget_set_opacity(st->opt_btn[i], t->set[i] ? 1.0 : 0.4);   /* faded = the system's */
+		if (st->opt_clear[i]) gtk_widget_set_sensitive(st->opt_clear[i], t->set[i]);
+	}
+
+	gtk_switch_set_active(GTK_SWITCH(st->pal_switch), t->has_palette);
+	gtk_widget_set_visible(st->pal_box, t->has_palette);
+	GdkRGBA def[FHI_PALETTE_SIZE];
+	fhi_theme_default_palette(def);
+	for (int i = 0; i < FHI_PALETTE_SIZE; i++)
+		gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(st->pal_btn[i]), t->has_palette ? &t->palette[i] : &def[i]);
+
+	gtk_range_set_value(GTK_RANGE(st->radius_scale), t->radius >= 0 ? t->radius : 6);
+	gtk_widget_set_opacity(st->radius_scale, t->radius >= 0 ? 1.0 : 0.4);
+	gtk_widget_set_sensitive(st->radius_clear, t->radius >= 0);
+	gtk_range_set_value(GTK_RANGE(st->opacity_scale), t->opacity);
+	theme_sync_labels(st);
+
+	guint sel = 0;
+	for (guint i = 0; st->themes && i < st->themes->len; i++)
+		if (st->theme_id && strcmp(((FhiThemeInfo *)st->themes->pdata[i])->id, st->theme_id) == 0) sel = i + 1;
+	gtk_drop_down_set_selected(GTK_DROP_DOWN(st->theme_dd), sel);
+
+	st->syncing = FALSE;
+}
+
+static void
+on_opt_color_set(GtkColorButton *button, gpointer user_data)
 {
 	State *st = user_data;
+	if (st->syncing) return;
 	int i = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "idx"));
-	gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(button), &st->cfg.col[i]);
+	gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(button), &st->cfg.theme.col[i]);
+	st->cfg.theme.col[i].alpha = 1.0;
+	st->cfg.theme.set[i] = TRUE;
+	theme_sync_widgets(st);
 	apply_all(st, TRUE);
 }
 
-static GtkWidget *
-color_row(State *st, int idx)
+static void
+on_opt_clear(GtkButton *button, gpointer user_data)
 {
-	GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
-	GtkWidget *label = gtk_label_new(color_label[idx]);
-	GtkWidget *button = gtk_color_button_new_with_rgba(&st->cfg.col[idx]);
+	State *st = user_data;
+	int i = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "idx"));
+	st->cfg.theme.set[i] = FALSE;
+	theme_sync_widgets(st);
+	apply_all(st, TRUE);
+}
+
+/* label, color button and (for colors that can follow the system) a button that unsets it */
+static GtkWidget *
+theme_color_row(State *st, int idx)
+{
+	GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+	GtkWidget *label = gtk_label_new(fhi_theme_color_label(idx));
+	GtkWidget *button = gtk_color_button_new();
 	gtk_label_set_xalign(GTK_LABEL(label), 0);
 	gtk_widget_set_hexpand(label, TRUE);
 	g_object_set_data(G_OBJECT(button), "idx", GINT_TO_POINTER(idx));
-	g_signal_connect(button, "color-set", G_CALLBACK(on_color_set), st);
+	g_signal_connect(button, "color-set", G_CALLBACK(on_opt_color_set), st);
 	gtk_box_append(GTK_BOX(row), label);
 	gtk_box_append(GTK_BOX(row), button);
-	st->color_btn[idx] = button;
+	st->opt_btn[idx] = button;
+	if (idx < TC_TOUCH) {
+		GtkWidget *clear = gtk_button_new_from_icon_name("edit-clear-symbolic");
+		gtk_widget_set_tooltip_text(clear, "Follow the system");
+		gtk_button_set_has_frame(GTK_BUTTON(clear), FALSE);
+		g_object_set_data(G_OBJECT(clear), "idx", GINT_TO_POINTER(idx));
+		g_signal_connect(clear, "clicked", G_CALLBACK(on_opt_clear), st);
+		gtk_box_append(GTK_BOX(row), clear);
+		st->opt_clear[idx] = clear;
+	}
 	return row;
 }
 
@@ -1806,8 +1956,66 @@ static void
 on_scheme_changed(GObject *dd, GParamSpec *pspec, gpointer user_data)
 {
 	State *st = user_data;
-	st->cfg.scheme = gtk_drop_down_get_selected(GTK_DROP_DOWN(dd));
+	if (st->syncing) return;
+	st->cfg.theme.scheme = gtk_drop_down_get_selected(GTK_DROP_DOWN(dd));
+	theme_sync_widgets(st);   /* the faded "system" colors depend on light / dark */
 	apply_all(st, TRUE);
+}
+
+static void
+on_pal_switch(GObject *sw, GParamSpec *pspec, gpointer user_data)
+{
+	State *st = user_data;
+	if (st->syncing) return;
+	FhiTheme *t = &st->cfg.theme;
+	t->has_palette = gtk_switch_get_active(GTK_SWITCH(sw));
+	if (t->has_palette) fhi_theme_default_palette(t->palette);
+	theme_sync_widgets(st);
+	apply_all(st, TRUE);
+}
+
+static void
+on_pal_color_set(GtkColorButton *button, gpointer user_data)
+{
+	State *st = user_data;
+	if (st->syncing) return;
+	int i = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "idx"));
+	gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(button), &st->cfg.theme.palette[i]);
+	st->cfg.theme.palette[i].alpha = 1.0;
+	apply_all(st, TRUE);
+}
+
+static void
+on_radius_changed(GtkRange *range, gpointer user_data)
+{
+	State *st = user_data;
+	if (st->syncing) return;
+	st->cfg.theme.radius = (int)gtk_range_get_value(range);
+	gtk_widget_set_opacity(st->radius_scale, 1.0);
+	gtk_widget_set_sensitive(st->radius_clear, TRUE);
+	theme_sync_labels(st);
+	apply_theme(st);
+	queue_save(st);
+}
+
+static void
+on_radius_clear(GtkButton *button, gpointer user_data)
+{
+	State *st = user_data;
+	st->cfg.theme.radius = -1;
+	theme_sync_widgets(st);
+	apply_all(st, TRUE);
+}
+
+static void
+on_opacity_changed(GtkRange *range, gpointer user_data)
+{
+	State *st = user_data;
+	if (st->syncing) return;
+	st->cfg.theme.opacity = (int)gtk_range_get_value(range);
+	theme_sync_labels(st);
+	apply_theme(st);   /* at 100 this takes the very same path as before the feature existed */
+	queue_save(st);
 }
 
 static gboolean
@@ -1834,21 +2042,191 @@ on_term_font_default(GtkButton *button, gpointer user_data)
 	apply_all(st, TRUE);
 }
 
+/* Rebuild the theme list: "Default" first, then every theme file found */
+static void
+theme_list_refresh(State *st)
+{
+	if (st->themes) g_ptr_array_unref(st->themes);
+	st->themes = fhi_theme_list(FHI_THEME_DIR);
+	GPtrArray *names = g_ptr_array_new();
+	g_ptr_array_add(names, (gpointer)"Default (system)");
+	for (guint i = 0; i < st->themes->len; i++) {
+		const FhiThemeInfo *info = st->themes->pdata[i];
+		g_ptr_array_add(names, info->user ? g_strdup_printf("%s  (yours)", info->name) : g_strdup(info->name));
+	}
+	g_ptr_array_add(names, NULL);
+	gboolean was = st->syncing;
+	st->syncing = TRUE;
+	gtk_string_list_splice(st->theme_names, 0, g_list_model_get_n_items(G_LIST_MODEL(st->theme_names)),
+	                       (const char *const *)names->pdata);
+	st->syncing = was;
+	for (guint i = 1; i + 1 < names->len; i++) g_free(names->pdata[i]);
+	g_ptr_array_free(names, TRUE);
+}
+
+static void
+on_theme_selected(GObject *dd, GParamSpec *pspec, gpointer user_data)
+{
+	State *st = user_data;
+	if (st->syncing) return;
+	guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(dd));
+	FhiTheme loaded;
+	fhi_theme_init(&loaded);
+	char *id = NULL;
+	if (sel > 0 && st->themes && sel - 1 < st->themes->len) {
+		const FhiThemeInfo *info = st->themes->pdata[sel - 1];
+		if (!fhi_theme_load_file(&loaded, info)) { fhi_theme_clear(&loaded); return; }
+		id = g_strdup(info->id);
+	}
+	/* How see-through the window is belongs to the screen, not to a look: keep it unless the theme insists */
+	if (loaded.opacity == 100) loaded.opacity = st->cfg.theme.opacity;
+	fhi_theme_copy(&st->cfg.theme, &loaded);
+	fhi_theme_clear(&loaded);
+	g_free(st->theme_id);
+	st->theme_id = id;
+	theme_sync_widgets(st);
+	apply_all(st, TRUE);
+}
+
+static void
+on_save_theme(GtkWidget *w, gpointer user_data)
+{
+	State *st = user_data;
+	const char *name = gtk_editable_get_text(GTK_EDITABLE(st->theme_entry));
+	char *id = fhi_theme_save_as(&st->cfg.theme, name);
+	if (id == NULL) return;   /* empty name, or the folder is not writable */
+	g_free(st->cfg.theme.name);
+	st->cfg.theme.name = g_strstrip(g_strdup(name));
+	g_free(st->theme_id);
+	st->theme_id = id;
+	theme_list_refresh(st);
+	theme_sync_widgets(st);
+	gtk_editable_set_text(GTK_EDITABLE(st->theme_entry), "");
+	save_settings(st);
+}
+
+static void
+open_with_default_app(const char *path)
+{
+	GFile *f = g_file_new_for_path(path);
+	char *uri = g_file_get_uri(f);
+	GError *error = NULL;
+	if (!g_app_info_launch_default_for_uri(uri, NULL, &error)) {
+		g_printerr("could not open %s: %s\n", path, error->message);
+		g_clear_error(&error);
+	}
+	g_free(uri);
+	g_object_unref(f);
+}
+
+static void
+on_open_themes_dir(GtkButton *button, gpointer user_data)
+{
+	char *dir = fhi_theme_user_dir();
+	g_mkdir_with_parents(dir, 0755);
+	open_with_default_app(dir);
+	g_free(dir);
+}
+
+static char *
+user_css_path(void)
+{
+	return g_build_filename(g_get_user_config_dir(), "fhi", "user.css", NULL);
+}
+
+static const char user_css_template[] =
+	"/* FHI user style sheet: plain GTK4 CSS. It is loaded LAST, so it beats the theme and\n"
+	" * everything else, and it reloads the moment you save it. Mistakes are printed in the\n"
+	" * terminal FHI was started from.\n"
+	" *\n"
+	" * Named colors (redefine one and every widget that uses it follows):\n"
+	" *   @theme_bg_color  @theme_fg_color  @theme_base_color  @theme_text_color\n"
+	" *   @theme_selected_bg_color  @theme_selected_fg_color\n"
+	" *\n"
+	" * FHI's own classes:\n"
+	" *   .fhi-row       a row of the file list      .fhi-icon     its file icon\n"
+	" *   .fhi-touch .fhi-create .fhi-dest .fhi-remove   command preview highlights\n"
+	" *   .fhi-info      the info bar under the list .fhi-sort     the sort hint\n"
+	" *   .fhi-menu      the menu panel              .fhi-key      keys in the cheat sheet\n"
+	" *   .fhi-sshcard   the SSH session card        .fhi-unsupported  the \"bash is not supported\" note\n"
+	" *\n"
+	" * Examples (remove the comment marks to try them):\n"
+	" *\n"
+	" * .fhi-row { padding: 6px 10px; }\n"
+	" * .fhi-info { font-family: monospace; }\n"
+	" * listview row:selected { background: alpha(@theme_selected_bg_color, 0.5); }\n"
+	" * headerbar { min-height: 28px; }\n"
+	" */\n";
+
+static void
+on_open_user_css(GtkButton *button, gpointer user_data)
+{
+	char *path = user_css_path();
+	if (!g_file_test(path, G_FILE_TEST_EXISTS)) {
+		char *dir = g_path_get_dirname(path);
+		g_mkdir_with_parents(dir, 0700);
+		g_file_set_contents(path, user_css_template, -1, NULL);
+		g_free(dir);
+	}
+	open_with_default_app(path);
+	g_free(path);
+}
+
 static void
 on_reset_theme(GtkButton *button, gpointer user_data)
 {
 	State *st = user_data;
-	Settings fresh;
-	settings_defaults(&fresh);
-	/* Setting the widgets fires their signals, which update st->cfg and the UI */
-	gtk_drop_down_set_selected(GTK_DROP_DOWN(st->scheme_dd), fresh.scheme);
-	for (int i = 0; i < C_COUNT; i++)
-		gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(st->color_btn[i]), &fresh.col[i]);
-	gtk_switch_set_active(GTK_SWITCH(st->term_switch), fresh.custom_term);
-	for (int i = 0; i < C_COUNT; i++) st->cfg.col[i] = fresh.col[i];   /* set_rgba is silent */
-	st->cfg.scheme = fresh.scheme;
-	st->cfg.custom_term = fresh.custom_term;
-	on_term_font_default(NULL, st);
+	int opacity = st->cfg.theme.opacity;
+	fhi_theme_clear(&st->cfg.theme);
+	fhi_theme_init(&st->cfg.theme);
+	st->cfg.theme.opacity = opacity;   /* see on_theme_selected */
+	g_clear_pointer(&st->theme_id, g_free);
+	theme_sync_widgets(st);
+	on_term_font_default(NULL, st);    /* applies and saves */
+}
+
+static void
+section_label(GtkWidget *page, const char *text)
+{
+	GtkWidget *l = gtk_label_new(text);
+	gtk_label_set_xalign(GTK_LABEL(l), 0);
+	gtk_widget_add_css_class(l, "dim-label");
+	gtk_widget_set_margin_top(l, 6);
+	gtk_box_append(GTK_BOX(page), l);
+}
+
+static GtkWidget *
+hint_label(const char *text)
+{
+	GtkWidget *l = gtk_label_new(text);
+	gtk_label_set_xalign(GTK_LABEL(l), 0);
+	gtk_label_set_wrap(GTK_LABEL(l), TRUE);
+	gtk_label_set_max_width_chars(GTK_LABEL(l), 34);
+	gtk_widget_add_css_class(l, "dim-label");
+	return l;
+}
+
+/* label on the left, `widget` filling the rest */
+static GtkWidget *
+labeled(const char *text, GtkWidget *widget)
+{
+	GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+	GtkWidget *label = gtk_label_new(text);
+	gtk_label_set_xalign(GTK_LABEL(label), 0);
+	gtk_widget_set_hexpand(label, TRUE);
+	gtk_box_append(GTK_BOX(row), label);
+	gtk_box_append(GTK_BOX(row), widget);
+	return row;
+}
+
+static GtkWidget *
+slider(double min, double max)
+{
+	GtkWidget *sc = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, min, max, 1);
+	gtk_scale_set_draw_value(GTK_SCALE(sc), FALSE);
+	gtk_widget_set_hexpand(sc, TRUE);
+	gtk_widget_set_size_request(sc, 110, -1);
+	return sc;
 }
 
 static GtkWidget *
@@ -1856,37 +2234,99 @@ build_theme_page(State *st, GtkWidget *stack)
 {
 	GtkWidget *page = sub_page(stack, "Theme");
 
-	GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
-	GtkWidget *label = gtk_label_new("Color scheme");
+	/* --- which theme --- */
+	st->theme_names = gtk_string_list_new(NULL);
+	st->theme_dd = gtk_drop_down_new(G_LIST_MODEL(st->theme_names), NULL);
+	gtk_widget_set_size_request(st->theme_dd, 150, -1);
+	theme_list_refresh(st);
+	gtk_box_append(GTK_BOX(page), labeled("Theme", st->theme_dd));
+
 	const char *const schemes[] = { "System", "Light", "Dark", NULL };
 	st->scheme_dd = gtk_drop_down_new_from_strings(schemes);
-	gtk_drop_down_set_selected(GTK_DROP_DOWN(st->scheme_dd), st->cfg.scheme);
-	gtk_label_set_xalign(GTK_LABEL(label), 0);
-	gtk_widget_set_hexpand(label, TRUE);
-	g_signal_connect(st->scheme_dd, "notify::selected", G_CALLBACK(on_scheme_changed), st);
-	gtk_box_append(GTK_BOX(row), label);
-	gtk_box_append(GTK_BOX(row), st->scheme_dd);
-	gtk_box_append(GTK_BOX(page), row);
+	gtk_box_append(GTK_BOX(page), labeled("Color scheme", st->scheme_dd));
 
-	GtkWidget *hl = gtk_label_new("Command preview highlights");
-	gtk_label_set_xalign(GTK_LABEL(hl), 0);
-	gtk_widget_add_css_class(hl, "dim-label");
-	gtk_box_append(GTK_BOX(page), hl);
-	for (int i = C_TOUCH; i <= C_REMOVE; i++) gtk_box_append(GTK_BOX(page), color_row(st, i));
+	GtkWidget *save_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+	st->theme_entry = gtk_entry_new();
+	gtk_entry_set_placeholder_text(GTK_ENTRY(st->theme_entry), "Save these colors as…");
+	gtk_widget_set_hexpand(st->theme_entry, TRUE);
+	gtk_editable_set_width_chars(GTK_EDITABLE(st->theme_entry), 1);
+	GtkWidget *save_btn = gtk_button_new_with_label("Save");
+	g_signal_connect(save_btn, "clicked", G_CALLBACK(on_save_theme), st);
+	g_signal_connect(st->theme_entry, "activate", G_CALLBACK(on_save_theme), st);
+	gtk_box_append(GTK_BOX(save_row), st->theme_entry);
+	gtk_box_append(GTK_BOX(save_row), save_btn);
+	gtk_box_append(GTK_BOX(page), save_row);
 
-	GtkWidget *tl = gtk_label_new("Terminal");
-	gtk_label_set_xalign(GTK_LABEL(tl), 0);
-	gtk_widget_add_css_class(tl, "dim-label");
-	gtk_box_append(GTK_BOX(page), tl);
-	GtkWidget *sw_row = switch_row(st, "Custom colors", &st->cfg.custom_term);
-	st->term_switch = gtk_widget_get_last_child(sw_row);
-	gtk_box_append(GTK_BOX(page), sw_row);
-	gtk_box_append(GTK_BOX(page), color_row(st, C_TERM_BG));
-	gtk_box_append(GTK_BOX(page), color_row(st, C_TERM_FG));
+	GtkWidget *files = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+	GtkWidget *open_dir = gtk_button_new_with_label("Themes folder");
+	GtkWidget *open_css = gtk_button_new_with_label("Edit user.css");
+	gtk_widget_set_hexpand(open_dir, TRUE);
+	gtk_widget_set_hexpand(open_css, TRUE);
+	gtk_widget_set_tooltip_text(open_dir, "Drop theme .ini files here (see the examples that came with FHI)");
+	gtk_widget_set_tooltip_text(open_css, "Your own CSS, applied on top of everything and reloaded when you save it");
+	g_signal_connect(open_dir, "clicked", G_CALLBACK(on_open_themes_dir), st);
+	g_signal_connect(open_css, "clicked", G_CALLBACK(on_open_user_css), st);
+	gtk_box_append(GTK_BOX(files), open_dir);
+	gtk_box_append(GTK_BOX(files), open_css);
+	gtk_box_append(GTK_BOX(page), files);
+	gtk_box_append(GTK_BOX(page), hint_label("Faded colors follow your system theme. Click one to set it, "
+	                                         "or the eraser to hand it back."));
+
+	/* --- interface --- */
+	section_label(page, "Interface");
+	for (int i = TC_WINDOW_BG; i <= TC_ACCENT; i++) gtk_box_append(GTK_BOX(page), theme_color_row(st, i));
+
+	GtkWidget *rrow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+	st->radius_scale = slider(0, 24);
+	g_signal_connect(st->radius_scale, "value-changed", G_CALLBACK(on_radius_changed), st);
+	st->radius_clear = gtk_button_new_from_icon_name("edit-clear-symbolic");
+	gtk_widget_set_tooltip_text(st->radius_clear, "Follow the system");
+	gtk_button_set_has_frame(GTK_BUTTON(st->radius_clear), FALSE);
+	g_signal_connect(st->radius_clear, "clicked", G_CALLBACK(on_radius_clear), st);
+	st->radius_label = gtk_label_new(NULL);
+	gtk_label_set_xalign(GTK_LABEL(st->radius_label), 0);
+	gtk_widget_set_size_request(st->radius_label, 120, -1);
+	gtk_box_append(GTK_BOX(rrow), st->radius_label);
+	gtk_box_append(GTK_BOX(rrow), st->radius_scale);
+	gtk_box_append(GTK_BOX(rrow), st->radius_clear);
+	gtk_box_append(GTK_BOX(page), rrow);
+
+	st->opacity_scale = slider(20, 100);
+	g_signal_connect(st->opacity_scale, "value-changed", G_CALLBACK(on_opacity_changed), st);
+	GtkWidget *orow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+	st->opacity_label = gtk_label_new(NULL);
+	gtk_label_set_xalign(GTK_LABEL(st->opacity_label), 0);
+	gtk_widget_set_size_request(st->opacity_label, 120, -1);
+	gtk_box_append(GTK_BOX(orow), st->opacity_label);
+	gtk_box_append(GTK_BOX(orow), st->opacity_scale);
+	gtk_box_append(GTK_BOX(page), orow);
+	gtk_box_append(GTK_BOX(page), hint_label(display_composited()
+	    ? "100 is solid and costs nothing. Below that the window blends with what is behind it."
+	    : "Your screen has no compositor, so the window cannot be see-through here."));
+
+	/* --- terminal --- */
+	section_label(page, "Terminal");
+	for (int i = TC_TERM_BG; i <= TC_CURSOR; i++) gtk_box_append(GTK_BOX(page), theme_color_row(st, i));
+	st->pal_switch = gtk_switch_new();
+	gtk_widget_set_valign(st->pal_switch, GTK_ALIGN_CENTER);
+	g_signal_connect(st->pal_switch, "notify::active", G_CALLBACK(on_pal_switch), st);
+	gtk_box_append(GTK_BOX(page), labeled("Custom ANSI colors", st->pal_switch));
+	GtkWidget *grid = gtk_grid_new();
+	gtk_grid_set_row_spacing(GTK_GRID(grid), 4);
+	gtk_grid_set_column_spacing(GTK_GRID(grid), 4);
+	for (int i = 0; i < FHI_PALETTE_SIZE; i++) {
+		st->pal_btn[i] = gtk_color_button_new();
+		g_object_set_data(G_OBJECT(st->pal_btn[i]), "idx", GINT_TO_POINTER(i));
+		g_signal_connect(st->pal_btn[i], "color-set", G_CALLBACK(on_pal_color_set), st);
+		gtk_grid_attach(GTK_GRID(grid), st->pal_btn[i], i % 8, i / 8, 1, 1);
+	}
+	st->pal_box = grid;
+	gtk_box_append(GTK_BOX(page), grid);
 
 	GtkWidget *fl = gtk_label_new("Terminal font");
 	gtk_label_set_xalign(GTK_LABEL(fl), 0);
 	gtk_widget_add_css_class(fl, "dim-label");
+	gtk_widget_set_margin_top(fl, 6);
 	gtk_box_append(GTK_BOX(page), fl);
 	GtkWidget *frow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
 	st->font_btn = gtk_font_button_new_with_font(st->cfg.term_font ? st->cfg.term_font : "Monospace 10");
@@ -1898,14 +2338,23 @@ build_theme_page(State *st, GtkWidget *stack)
 	gtk_box_append(GTK_BOX(frow), st->font_btn);
 	gtk_box_append(GTK_BOX(frow), fdef);
 	gtk_box_append(GTK_BOX(page), frow);
-	GtkWidget *fh = gtk_label_new("Nerd Font icons always work as a fallback.");
-	gtk_label_set_xalign(GTK_LABEL(fh), 0);
-	gtk_widget_add_css_class(fh, "dim-label");
-	gtk_box_append(GTK_BOX(page), fh);
+	gtk_box_append(GTK_BOX(page), hint_label("Nerd Font icons always work as a fallback."));
+
+	/* --- command preview --- */
+	section_label(page, "Command preview highlights");
+	for (int i = TC_TOUCH; i <= TC_REMOVE; i++) gtk_box_append(GTK_BOX(page), theme_color_row(st, i));
 
 	GtkWidget *reset = gtk_button_new_with_label("Reset to defaults");
+	gtk_widget_set_margin_top(reset, 6);
 	g_signal_connect(reset, "clicked", G_CALLBACK(on_reset_theme), st);
 	gtk_box_append(GTK_BOX(page), reset);
+
+	/* connect the two drop-downs last: filling them in must not look like the user choosing */
+	st->syncing = TRUE;
+	theme_sync_widgets(st);
+	st->syncing = FALSE;
+	g_signal_connect(st->theme_dd, "notify::selected", G_CALLBACK(on_theme_selected), st);
+	g_signal_connect(st->scheme_dd, "notify::selected", G_CALLBACK(on_scheme_changed), st);
 	return page;
 }
 
@@ -2224,6 +2673,51 @@ build_menu_layer(State *st)
 	return layer;
 }
 
+/* ---- ~/.config/fhi/user.css: the user's own CSS, last word on everything ---- */
+static void user_css_setup(State *st);
+
+static void
+on_user_css_error(GtkCssProvider *provider, GtkCssSection *section, GError *error, gpointer user_data)
+{
+	const GtkCssLocation *at = gtk_css_section_get_start_location(section);
+	g_printerr("fhi: user.css line %u: %s\n", (unsigned)at->lines + 1, error->message);
+}
+
+static void
+user_css_load(State *st)
+{
+	char *path = user_css_path();
+	if (g_file_test(path, G_FILE_TEST_IS_REGULAR)) gtk_css_provider_load_from_path(st->user_css, path);
+	else gtk_css_provider_load_from_data(st->user_css, "", 0);
+	g_free(path);
+}
+
+static void
+on_user_css_changed(GFileMonitor *mon, GFile *file, GFile *other, GFileMonitorEvent ev, gpointer user_data)
+{
+	if (ev == G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT || ev == G_FILE_MONITOR_EVENT_CREATED ||
+	    ev == G_FILE_MONITOR_EVENT_DELETED || ev == G_FILE_MONITOR_EVENT_MOVED_IN ||
+	    ev == G_FILE_MONITOR_EVENT_RENAMED || ev == G_FILE_MONITOR_EVENT_MOVED_OUT)
+		user_css_load(user_data);
+}
+
+static void
+user_css_setup(State *st)
+{
+	st->user_css = gtk_css_provider_new();
+	g_signal_connect(st->user_css, "parsing-error", G_CALLBACK(on_user_css_error), NULL);
+	gtk_style_context_add_provider_for_display(gdk_display_get_default(),
+	    GTK_STYLE_PROVIDER(st->user_css), GTK_STYLE_PROVIDER_PRIORITY_USER);
+	user_css_load(st);
+
+	char *path = user_css_path();
+	GFile *f = g_file_new_for_path(path);
+	st->user_css_mon = g_file_monitor_file(f, G_FILE_MONITOR_WATCH_MOVES, NULL, NULL);   /* NULL if it cannot: no live reload, nothing else lost */
+	if (st->user_css_mon) g_signal_connect(st->user_css_mon, "changed", G_CALLBACK(on_user_css_changed), st);
+	g_object_unref(f);
+	g_free(path);
+}
+
 static void
 activate(GtkApplication *app, gpointer user_data)
 {
@@ -2250,6 +2744,7 @@ activate(GtkApplication *app, gpointer user_data)
 	st->css = gtk_css_provider_new();
 	gtk_style_context_add_provider_for_display(gdk_display_get_default(),
 	    GTK_STYLE_PROVIDER(st->css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+	user_css_setup(st);
 	GtkWidget *pane = gtk_paned_new (GTK_ORIENTATION_HORIZONTAL);
 	GtkWidget *frame1 = gtk_frame_new (NULL);
 	GtkWidget *frame2 = gtk_frame_new (NULL);
@@ -2408,6 +2903,7 @@ activate(GtkApplication *app, gpointer user_data)
 	gtk_window_set_child(GTK_WINDOW(window), overlay);
 	/* The panel sits in an overlay so a message can float over it when it is dimmed */
 	st->left_panel = left;
+	gtk_widget_add_css_class(left, "fhi-leftpanel");   /* the one layer that carries the panel's transparency */
 	st->unsupported_label = gtk_label_new(NULL);
 	gtk_widget_add_css_class(st->unsupported_label, "fhi-unsupported");
 	gtk_widget_set_halign(st->unsupported_label, GTK_ALIGN_CENTER);

@@ -27,7 +27,7 @@ else()
 	set(FHI_DATA_DIR "${CMAKE_SOURCE_DIR}")
 endif()
 
-add_executable(FHI main.c preview.c filetype.c gitinfo.c sshinfo.c)
+add_executable(FHI main.c preview.c filetype.c gitinfo.c sshinfo.c theme.c)
 target_link_libraries(FHI PRIVATE PkgConfig::GTK4 PkgConfig::VTE PkgConfig::FONTCONFIG)
 
 # Folders with the zsh startup files (the program tells zsh to read them via ZDOTDIR)
@@ -35,7 +35,8 @@ target_link_libraries(FHI PRIVATE PkgConfig::GTK4 PkgConfig::VTE PkgConfig::FONT
 target_compile_definitions(FHI PRIVATE
 	FHI_ZSH_DIR="${FHI_DATA_DIR}/zsh"
 	FHI_ICON_DIR="${FHI_DATA_DIR}/icons"
-	FHI_FONT_DIR="${FHI_DATA_DIR}/fonts")
+	FHI_FONT_DIR="${FHI_DATA_DIR}/fonts"
+	FHI_THEME_DIR="${FHI_DATA_DIR}/themes")
 
 if(FHI_PACKAGE)
 	include(GNUInstallDirs)
@@ -43,6 +44,7 @@ if(FHI_PACKAGE)
 	install(DIRECTORY zsh/ DESTINATION share/fhi/zsh)   # includes the dotfiles
 	install(FILES icons/fhi.png DESTINATION share/fhi/icons)
 	install(DIRECTORY fonts/ DESTINATION share/fhi/fonts)   # Nerd Font symbols (MIT)
+	install(DIRECTORY themes/ DESTINATION share/fhi/themes)   # example / bundled themes
 	install(FILES icons/fhi.png DESTINATION share/icons/hicolor/256x256/apps)
 	install(FILES packaging/dev.forcedev.myterm.desktop DESTINATION share/applications)
 	install(FILES LICENSE DESTINATION share/doc/fhi RENAME copyright)

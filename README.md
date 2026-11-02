@@ -36,6 +36,42 @@ press Enter.
 - **Hamburger menu** (button, or `Tab` in the list) – theme and colors, cheat sheet, hidden files,
   sorting and info settings.
 
+## Theming
+
+FHI follows your GTK theme by default. Everything below is optional, and anything a theme leaves
+out keeps following the system, so a desktop that is already pink gives you a pink FHI with no
+setup. Pick a theme or tweak any color in the menu (**Theme**), or write it down:
+
+- **Theme files** – small INI files in `~/.config/fhi/themes/` (yours win) and the install folder
+  (`/usr/share/fhi/themes`). They show up in the Theme page, and *Save these colors as…* writes
+  one for you. Every key is optional:
+
+  ```ini
+  [theme]
+  name       = Pastel Pink
+  scheme     = light            # light | dark | system
+  window_bg  = #fff0f5          # window, title bar, menus
+  window_fg  = #5b3a4a          # text
+  panel_bg   = #fff8fb          # the file list
+  accent     = #f28cb1          # selection, switches, focus
+  term_bg    = #fff5f8          # terminal background / text / cursor
+  term_fg    = #6b4457
+  cursor     = #e75a8f
+  palette    = #6b4457;#e0607e;...   # the terminal's 16 ANSI colors
+  touch = #f5d08a   create = #a3d9b9   dest = #a3c0ee   remove = #f28ba2   # command preview
+  radius     = 12               # corner radius in px
+  opacity    = 90               # window transparency, 20..100
+  ```
+
+  A few examples (Pastel Pink, Dracula, Nord, Gruvbox, Solarized, Catppuccin) are in
+  [`themes/`](themes/). Copy one and edit it.
+- **`~/.config/fhi/user.css`** – your own GTK CSS, loaded last and reloaded the moment you save
+  it (the menu's *Edit user.css* creates it with a cheat sheet of the class names and colors).
+  Mistakes are reported with their line number on the terminal FHI was started from.
+- **Transparency** – the *Opacity* slider needs a compositor (any Wayland session, or a
+  compositing X11 window manager). At 100 % (the default) nothing extra is set up at all: no
+  extra style rules, no blending. Only a window you actually made see-through pays for it.
+
 ## Install
 
 Needs **zsh**, GTK 4, VTE for GTK 4 (`libvte-2.91-gtk4`: Debian 13+ / Ubuntu 24.04+, Fedora, Arch)
