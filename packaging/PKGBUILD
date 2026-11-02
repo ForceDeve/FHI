@@ -1,0 +1,25 @@
+# Maintainer: ForceDev <62995666+ForceDeve@users.noreply.github.com>
+# Build on Arch: put fhi-$pkgver.tar.gz (from packaging/build-tarball.sh) next to this file, run makepkg -si
+pkgname=fhi
+pkgver=0.1.5
+pkgrel=1
+pkgdesc="Terminal with a file list that previews what your command will do"
+arch=('x86_64' 'aarch64')
+url="https://github.com/ForceDeve"
+license=('custom:FHI')
+depends=('gtk4' 'vte4' 'zsh' 'fontconfig' 'pango' 'glib2')
+makedepends=('cmake' 'ninja')
+optdepends=('git: preview of what git commit / git push will include')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cmake -S "$pkgname-$pkgver" -B build -G Ninja -DFHI_PACKAGE=ON \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+  cmake --build build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build --strip
+  install -Dm644 "$pkgname-$pkgver/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

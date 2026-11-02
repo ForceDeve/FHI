@@ -16,3 +16,6 @@
 # Local tool config: the CLion MCP port changes every session
 /.mcp.json
 /.claude/
+
+# zsh completion cache, generated when FHI starts zsh
+/zsh/.zcompdump*
