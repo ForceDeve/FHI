@@ -13,6 +13,7 @@
 #include "preview.h"
 #include "filetype.h"
 #include "gitinfo.h"
+#include "sshinfo.h"
 #include <strings.h>
 
 /* Indexes into Settings.col */
@@ -90,6 +91,8 @@ typedef struct {
 	GtkWidget *left_panel;           /* the file list side: dimmed when an unsupported shell runs */
 	GtkWidget *unsupported_label;    /* "bash is not supported", over the panel */
 	char *unsupported_shell;         /* name of that shell, NULL while all is fine */
+	FhiSsh *ssh;                     /* the ssh session in front of the terminal, NULL if none */
+	GtkWidget *ssh_card;             /* session info, over the dimmed panel */
 	GtkWidget *last_pane;            /* list or terminal: where focus goes after the menu closes */
 	GtkWidget *font_btn;             /* terminal font chooser */
 	GtkWidget *scheme_dd;            /* theme page widgets, kept so "Reset" can update them */
@@ -656,12 +659,20 @@ on_cwd_changed(VteTerminal *terminal, gpointer user_data)
  * PID. While vim runs, the foreground group is vim's, so the numbers differ.
  */
 /* Name of the program in front of the terminal (new string, free it), NULL if unknown */
+/* Process id of the program in front of the terminal (0 if unknown) */
+static pid_t
+foreground_pid(State *st)
+{
+	VtePty *pty = vte_terminal_get_pty(VTE_TERMINAL(st->terminal));
+	if (pty == NULL || st->shell_pid <= 0) return 0;
+	pid_t pgid = tcgetpgrp(vte_pty_get_fd(pty));
+	return pgid > 0 ? pgid : 0;
+}
+
 static char *
 foreground_comm(State *st)
 {
-	VtePty *pty = vte_terminal_get_pty(VTE_TERMINAL(st->terminal));
-	if (pty == NULL || st->shell_pid <= 0) return NULL;
-	pid_t pgid = tcgetpgrp(vte_pty_get_fd(pty));
+	pid_t pgid = foreground_pid(st);
 	if (pgid <= 0) return NULL;
 	/* The leader of the foreground process group is the program itself; its name is in /proc */
 	char *file = g_strdup_printf("/proc/%d/comm", (int)pgid);
@@ -1053,14 +1064,16 @@ paste_selected_path(State *st)
 
 
 /*
- * Every half second: is a shell other than zsh running in the terminal? Nothing tells
- * us when the foreground program changes, so we look. Then the file list is dimmed
- * and says so, because its preview and cd features would not work.
+ * Every half second: is a shell other than zsh, or an ssh session, running in the
+ * terminal? Nothing tells us when the foreground program changes, so we look. Then the
+ * file list is dimmed, because its preview and cd features would not work (they are
+ * about THIS machine), and a message or the ssh session card is shown over it.
  */
 static gboolean
 check_shell_support(gpointer user_data)
 {
 	State *st = user_data;
+	pid_t pid = foreground_pid(st);
 	char *comm = foreground_comm(st);
 	const char *bad = (comm && is_unsupported_shell(comm)) ? comm : NULL;
 
@@ -1072,11 +1085,27 @@ check_shell_support(gpointer user_data)
 			gtk_label_set_text(GTK_LABEL(st->unsupported_label), text);
 			g_free(text);
 		}
-		gtk_widget_set_sensitive(st->left_panel, bad == NULL);
-		if (bad) gtk_widget_add_css_class(st->left_panel, "fhi-dim");
-		else gtk_widget_remove_css_class(st->left_panel, "fhi-dim");
 		gtk_widget_set_visible(st->unsupported_label, bad != NULL);
 	}
+
+	/* ssh: start / stop watching it */
+	if (comm && pid > 0 && strcmp(comm, "ssh") == 0) {
+		if (st->ssh && fhi_ssh_pid(st->ssh) != pid) {   /* a new ssh replaced the old one */
+			fhi_ssh_free(st->ssh);
+			st->ssh = NULL;
+		}
+		if (st->ssh == NULL) st->ssh = fhi_ssh_new(pid);
+	} else if (st->ssh) {
+		fhi_ssh_free(st->ssh);
+		st->ssh = NULL;
+	}
+	fhi_ssh_card_update(st->ssh_card, st->ssh);
+
+	gboolean dim = bad != NULL || st->ssh != NULL;
+	gtk_widget_set_sensitive(st->left_panel, !dim);
+	if (dim) gtk_widget_add_css_class(st->left_panel, "fhi-dim");
+	else gtk_widget_remove_css_class(st->left_panel, "fhi-dim");
+
 	g_free(comm);
 	return G_SOURCE_CONTINUE;
 }
@@ -1532,6 +1561,9 @@ apply_all(State *st, gboolean save)
 	    ".fhi-top    { padding: 4px; }"
 	    ".fhi-unsupported { background: alpha(@theme_bg_color, 0.95); font-weight: bold; padding: 8px 12px; border-radius: 6px; }"
 	    ".fhi-dim    { opacity: 0.35; }"
+	    ".fhi-sshcard { background: alpha(@theme_bg_color, 0.96); padding: 12px 16px; border-radius: 8px;"
+	    "               border: 1px solid alpha(currentColor, 0.25); box-shadow: 0 4px 16px alpha(black, 0.35); }"
+	    ".fhi-sshtitle { font-weight: bold; font-size: 12pt; }"
 	    ".fhi-square, .fhi-square > border, .fhi-square scrolledwindow { border-radius: 0; }"
 	    ".fhi-sort   { font-size: 8pt; opacity: 0.5; padding: 4px 8px; }"
 	    ".fhi-swatch { min-width: 14px; min-height: 14px; border-radius: 3px; }",
@@ -2304,6 +2336,8 @@ activate(GtkApplication *app, gpointer user_data)
 	GtkWidget *left_overlay = gtk_overlay_new();
 	gtk_overlay_set_child(GTK_OVERLAY(left_overlay), left);
 	gtk_overlay_add_overlay(GTK_OVERLAY(left_overlay), st->unsupported_label);
+	st->ssh_card = fhi_ssh_card_new();
+	gtk_overlay_add_overlay(GTK_OVERLAY(left_overlay), st->ssh_card);
 	g_timeout_add(500, check_shell_support, st);
 	gtk_widget_add_css_class(frame1, "fhi-square");   /* no rounded corners on the two panels */
 	gtk_widget_add_css_class(frame2, "fhi-square");
