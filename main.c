@@ -1343,6 +1343,7 @@ apply_all(State *st, gboolean save)
 	    "              border-right: 1px solid alpha(currentColor, 0.25);"
 	    "              box-shadow: 4px 0 14px alpha(black, 0.35); }"
 	    ".fhi-top    { padding: 4px; }"
+	    ".fhi-square, .fhi-square > border, .fhi-square scrolledwindow { border-radius: 0; }"
 	    ".fhi-sort   { font-size: 8pt; opacity: 0.5; padding: 4px 8px; }"
 	    ".fhi-swatch { min-width: 14px; min-height: 14px; border-radius: 3px; }",
 	    col[0], col[1], col[2], col[3], c->info_font);
@@ -2102,6 +2103,8 @@ activate(GtkApplication *app, gpointer user_data)
 	gtk_overlay_set_child(GTK_OVERLAY(overlay), pane);
 	gtk_overlay_add_overlay(GTK_OVERLAY(overlay), build_menu_layer(st));
 	gtk_window_set_child(GTK_WINDOW(window), overlay);
+	gtk_widget_add_css_class(frame1, "fhi-square");   /* no rounded corners on the two panels */
+	gtk_widget_add_css_class(frame2, "fhi-square");
 	gtk_frame_set_child(GTK_FRAME(frame1), left);
 	gtk_frame_set_child(GTK_FRAME(frame2), terminal);
 	apply_all(st, FALSE);
