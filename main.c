@@ -1008,6 +1008,17 @@ python_literal(const char *path)
  * Any other program in front: do nothing, we would only type garbage into it.
  */
 static void
+copy_from_terminal(State *st) {
+	VteTerminal *terminal = VTE_TERMINAL(st->terminal);
+	if (vte_terminal_get_has_selection(terminal))
+		vte_terminal_copy_clipboard_format(terminal, VTE_FORMAT_TEXT);
+}
+static void
+paste_from_clipboard(State *st) {
+
+	vte_terminal_paste_clipboard(VTE_TERMINAL(st->terminal));
+}
+static void
 paste_selected_path(State *st)
 {
 	Foreground fg = foreground_kind(st);
@@ -1156,7 +1167,20 @@ on_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode,
 			return TRUE;
 		}
 	}
+	if ((modifiers & GDK_CONTROL_MASK) && (modifiers & GDK_SHIFT_MASK) ) {
+		switch (keyval) {
+		case GDK_KEY_v:
+		case GDK_KEY_V:
+			paste_from_clipboard(st);
+			return TRUE;
+		case GDK_KEY_c:
+		case GDK_KEY_C:
+			copy_from_terminal(st);
+			return TRUE;
+		}
 
+
+	}
 	/* The rest are Shift+key shortcuts */
 	if (modifiers != GDK_SHIFT_MASK) return FALSE;
 
