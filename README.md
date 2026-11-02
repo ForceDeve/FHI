@@ -13,6 +13,9 @@ press Enter.
   quoting, `sudo`, redirections and pipes. Files a command would create appear as faint ghost rows.
 - **Keyboard-driven list** – `Shift+←/→` switch between list and terminal, `Enter` opens a file or
   `cd`s into a folder, `Shift+Enter` types the path onto your command line, `Backspace` is `cd ..`.
+- **Folder peeking** – `→` opens the highlighted folder inside the list (indented, nesting works,
+  no `cd`); `←` closes it, or jumps from an entry back to its folder. `Enter` still `cd`s, and keeps
+  whatever you were typing on the command line.
 - **Search by typing** – type in the list to filter with shell patterns (`*.png`, `{a,b}*`, `!*.o`).
   `Enter` keeps the filter, `Esc` clears it.
 - **Sorting** – name, size, modified, created or type; `Shift+↑/↓` changes the mode, `Ctrl+R` reverses.

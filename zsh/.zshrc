@@ -122,3 +122,21 @@ __fhi_prompt_ready() {
 }
 
 add-zsh-hook precmd __fhi_prompt_ready
+
+# ---------------------------------------------------------------------------
+# "Run a command without losing what is being typed"
+#
+# Pressing Enter on a folder in the file list makes FHI run `cd` for you. If you
+# had half a command on the line, typing the cd on top of it would mangle both.
+# So FHI first sends the (invented, otherwise unused) key sequence ESC [ 7000 ~,
+# which runs zsh's push-line: the half-typed line is set aside and comes back at
+# the next prompt, right after the cd finished.
+# ---------------------------------------------------------------------------
+__fhi_push_line() {
+  zle push-line
+  zle -K main 2>/dev/null   # a line typed next must not be read as vi commands
+}
+zle -N __fhi_push_line
+bindkey -M emacs $'\e[7000~' __fhi_push_line
+bindkey -M viins $'\e[7000~' __fhi_push_line
+bindkey -M vicmd $'\e[7000~' __fhi_push_line

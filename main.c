@@ -66,6 +66,9 @@ typedef struct {
 
 	/* --- command preview (highlighting files the typed command affects) --- */
 	GListStore *ghosts;              /* fake rows for files that do not exist yet */
+	GListStore *peeks;               /* rows of opened ("peeked") folders, shown indented */
+	GHashTable *expanded;            /* paths of the folders that are peeked open (a set) */
+	GHashTable *peek_info;           /* path -> GFileInfo of a peeked folder's own row, for sorting */
 	GHashTable *roles;               /* file name -> FhiRole, for the highlighting */
 	GHashTable *bound_rows;          /* the row widgets currently on screen */
 	char *last_buffer;               /* the last command line text we received */
@@ -117,6 +120,65 @@ child_exited(VteTerminal *terminal, int status, gpointer user_data)
 	gtk_window_destroy(GTK_WINDOW(user_data));
 }
 
+
+/* What we ask the file system about every file (the list and peeked folders) */
+#define FHI_ATTRS "standard::name,standard::display-name,standard::icon,standard::type,standard::size,time::modified,time::created"
+
+/* ======================================================================== */
+/* Folder peeking                                                             */
+/*                                                                            */
+/* Right arrow opens the highlighted folder INSIDE the list, indented, without */
+/* changing directory; Left arrow closes it. The opened rows live in their own */
+/* model (st->peeks) next to the real files. Each peeked row carries extra     */
+/* attributes: "fhi::depth" (indent level), "fhi::parent" (path of the folder  */
+/* it is in) and "fhi::path" (its own full path).                             */
+/* ======================================================================== */
+
+static guint
+row_depth(GFileInfo *info)
+{
+	return g_file_info_has_attribute(info, "fhi::depth")
+	       ? g_file_info_get_attribute_uint32(info, "fhi::depth") : 0;
+}
+
+/* Full path of a row (new string, free it), NULL for ghosts */
+static char *
+row_path(GFileInfo *info)
+{
+	const char *p = g_file_info_get_attribute_string(info, "fhi::path");
+	if (p) return g_strdup(p);
+	if (g_file_info_get_attribute_boolean(info, "fhi::ghost")) return NULL;
+	GFile *file = G_FILE(g_file_info_get_attribute_object(info, "standard::file"));
+	return file ? g_file_get_path(file) : NULL;
+}
+
+/* Name that tells two siblings apart: the plain name at top level, the full path inside a peeked folder */
+static const char *
+row_key(GFileInfo *info)
+{
+	const char *p = g_file_info_get_attribute_string(info, "fhi::path");
+	return p ? p : g_file_info_get_name(info);
+}
+
+#define PEEK_MAX_DEPTH 24
+
+/* The folders a row sits in, outermost first, ending with the row itself. Returns the length. */
+static int
+row_chain(State *st, GFileInfo *row, GFileInfo **chain)
+{
+	GFileInfo *tmp[PEEK_MAX_DEPTH];
+	int n = 0;
+	GFileInfo *cur = row;
+	while (cur != NULL && n < PEEK_MAX_DEPTH) {
+		tmp[n++] = cur;
+		const char *parent = g_file_info_get_attribute_string(cur, "fhi::parent");
+		if (parent == NULL) break;
+		cur = g_hash_table_lookup(st->peek_info, parent);
+	}
+	for (int i = 0; i < n; i++) chain[i] = tmp[n - 1 - i];
+	return n;
+}
+
 /* The CSS classes used to color a row, indexed by FhiRole (see style in activate) */
 static const char *const role_class[] = {
 	NULL, "fhi-touch", "fhi-create", "fhi-dest", "fhi-remove"
@@ -159,6 +221,26 @@ setup_item(GtkSignalListItemFactory *factory, GtkListItem *item, gpointer user_d
 	gtk_list_item_set_child(item, box);
 }
 
+/* (Re)draw the icon of a bound row: Nerd Font glyph, "open folder" while the folder is peeked open */
+static void
+update_row_icon(State *st, GtkWidget *box)
+{
+	GFileInfo *info = g_object_get_data(G_OBJECT(box), "fhi-info");
+	GtkWidget *icon = gtk_widget_get_first_child(box);
+	if (info == NULL) return;
+	gboolean is_dir = g_file_info_get_file_type(info) == G_FILE_TYPE_DIRECTORY;
+	const char *color;
+	const char *glyph = fhi_file_icon(g_file_info_get_name(info), is_dir, &color);
+	if (is_dir && g_hash_table_size(st->expanded) > 0) {
+		char *path = row_path(info);
+		if (path && g_hash_table_contains(st->expanded, path)) glyph = "\uf07c";   /* open folder */
+		g_free(path);
+	}
+	char *markup = g_markup_printf_escaped("<span foreground=\"%s\">%s</span>", color, glyph);
+	gtk_label_set_markup(GTK_LABEL(icon), markup);
+	g_free(markup);
+}
+
 /* "bind": a row widget now has to show this particular file. */
 static void
 bind_item(GtkSignalListItemFactory *factory, GtkListItem *item, gpointer user_data)
@@ -166,21 +248,18 @@ bind_item(GtkSignalListItemFactory *factory, GtkListItem *item, gpointer user_da
 	State *st = user_data;
 	GFileInfo *info = G_FILE_INFO(gtk_list_item_get_item(item));
 	GtkWidget *box = gtk_list_item_get_child(item);
-	GtkWidget *icon = gtk_widget_get_first_child(box);
 	GtkWidget *label = gtk_widget_get_last_child(box);
 
-	const char *color;
-	const char *glyph = fhi_file_icon(g_file_info_get_name(info),
-	                                  g_file_info_get_file_type(info) == G_FILE_TYPE_DIRECTORY, &color);
-	char *markup = g_markup_printf_escaped("<span foreground=\"%s\">%s</span>", color, glyph);
-	gtk_label_set_markup(GTK_LABEL(icon), markup);
-	g_free(markup);
+	gboolean peeked = g_file_info_has_attribute(info, "fhi::depth");
+	g_object_set_data(G_OBJECT(box), "fhi-info", info);   /* borrowed: valid while the row is bound */
+	update_row_icon(st, box);
+	gtk_widget_set_margin_start(box, row_depth(info) * 18);
 	gtk_label_set_text(GTK_LABEL(label), g_file_info_get_display_name(info));
 
 	/* Remember which file this row shows, and keep track of the row, so that
 	 * update_preview() can recolor it later without GTK asking again. */
 	g_object_set_data_full(G_OBJECT(box), "fhi-name",
-	                       g_strdup(g_file_info_get_name(info)), g_free);
+	                       peeked ? NULL : g_strdup(g_file_info_get_name(info)), g_free);   /* peeked rows are never highlighted */
 	g_hash_table_add(st->bound_rows, box);
 
 	if (g_file_info_get_attribute_boolean(info, "fhi::ghost"))
@@ -213,12 +292,11 @@ cmp_u64(guint64 a, guint64 b)
 	return a < b ? -1 : a > b;
 }
 
+/* Order two files that sit in the same folder, by the chosen sort mode */
 static int
-compare_info(gconstpointer pa, gconstpointer pb, gpointer user_data)
+compare_siblings(State *st, GFileInfo *a, GFileInfo *b)
 {
-	State *st = user_data;
 	const Settings *c = &st->cfg;
-	GFileInfo *a = G_FILE_INFO((gpointer)pa), *b = G_FILE_INFO((gpointer)pb);
 
 	if (c->folders_first) {
 		gboolean da = g_file_info_get_file_type(a) == G_FILE_TYPE_DIRECTORY;
@@ -248,6 +326,28 @@ compare_info(gconstpointer pa, gconstpointer pb, gpointer user_data)
 	if (r == 0)   /* same size / date / type: fall back to the name */
 		r = g_utf8_collate(g_file_info_get_display_name(a), g_file_info_get_display_name(b));
 	return c->sort_reverse ? -r : r;
+}
+
+/*
+ * The sorter of the whole list. A peeked row must stay right below its folder, so
+ * we compare the two "paths" folder by folder: the first place where they differ
+ * is a pair of siblings, which compare_siblings() orders. If one path is just the
+ * start of the other, the shorter one (the folder itself) comes first.
+ */
+static int
+compare_info(gconstpointer pa, gconstpointer pb, gpointer user_data)
+{
+	State *st = user_data;
+	GFileInfo *a = G_FILE_INFO((gpointer)pa), *b = G_FILE_INFO((gpointer)pb);
+	GFileInfo *ca[PEEK_MAX_DEPTH], *cb[PEEK_MAX_DEPTH];
+	int na = row_chain(st, a, ca), nb = row_chain(st, b, cb);
+
+	for (int i = 0; i < na && i < nb; i++) {
+		if (ca[i] == cb[i]) continue;
+		if (g_strcmp0(row_key(ca[i]), row_key(cb[i])) != 0)
+			return compare_siblings(st, ca[i], cb[i]);
+	}
+	return na < nb ? -1 : na > nb;
 }
 
 /* A row for a file that does not exist yet but the typed command would create. */
@@ -409,12 +509,17 @@ on_title_changed(VteTerminal *terminal, gpointer user_data)
 	g_free(buffer);
 }
 
+static void peek_refresh(State *st);
+static void peek_clear_all(State *st);
+static gboolean list_has_focus(State *st);
+
 /* Runs once GTK is idle, i.e. after it has finished handling the file change. */
 static gboolean
 preview_idle_cb(gpointer user_data)
 {
 	State *st = user_data;
 	st->preview_idle = 0;
+	peek_refresh(st);
 	update_preview(st, st->last_buffer ? st->last_buffer : "");
 	return G_SOURCE_REMOVE;   /* run only once */
 }
@@ -452,8 +557,14 @@ on_cwd_changed(VteTerminal *terminal, gpointer user_data)
 	/* The signal fires before every prompt, even if we did not change folder.
 	 * Only reload the list when the directory really is a different one. */
 	GFile *current = gtk_directory_list_get_file(list); /* not ours: do not unref */
-	if (current == NULL || !g_file_equal(current, file))
+	if (current == NULL || !g_file_equal(current, file)) {
+		/* The focused row is thrown away with the old list, and GTK would then
+		 * hand the focus to the terminal. Take it back afterwards. */
+		gboolean had_focus = list_has_focus(st);
+		peek_clear_all(st);
 		gtk_directory_list_set_file(list, file);
+		if (had_focus) gtk_widget_grab_focus(st->list_view);
+	}
 
 	/* We created "file", so we release it. The list took its own reference.
 	 * (We never unref "list": we did not create it, the sort model owns it.) */
@@ -488,6 +599,211 @@ type_into_terminal(State *st, const char *text)
 	vte_terminal_feed_child(VTE_TERMINAL(st->terminal), text, -1);
 }
 
+static void
+refresh_row_icons(State *st)
+{
+	GHashTableIter it;
+	gpointer box;
+	g_hash_table_iter_init(&it, st->bound_rows);
+	while (g_hash_table_iter_next(&it, &box, NULL)) update_row_icon(st, box);
+}
+
+static gboolean
+list_has_focus(State *st)
+{
+	GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(st->window));
+	return focus != NULL && (focus == st->list_view || gtk_widget_is_ancestor(focus, st->list_view));
+}
+
+/* Close every peeked folder (used when the directory changes) */
+static void
+peek_clear_all(State *st)
+{
+	g_hash_table_remove_all(st->expanded);
+	g_hash_table_remove_all(st->peek_info);
+	g_list_store_remove_all(st->peeks);
+}
+
+static void
+peek_open(State *st, GFileInfo *info)
+{
+	if (g_file_info_get_attribute_boolean(info, "fhi::ghost")) return;
+	GFile *file = G_FILE(g_file_info_get_attribute_object(info, "standard::file"));
+	char *path = row_path(info);
+	guint depth = row_depth(info) + 1;
+	if (file == NULL || path == NULL || depth >= PEEK_MAX_DEPTH || g_hash_table_contains(st->expanded, path) ||
+	    g_file_query_file_type(file, G_FILE_QUERY_INFO_NONE, NULL) != G_FILE_TYPE_DIRECTORY) {
+		g_free(path);
+		return;
+	}
+	GFileEnumerator *en = g_file_enumerate_children(file, FHI_ATTRS, G_FILE_QUERY_INFO_NONE, NULL, NULL);
+	if (en == NULL) {   /* no permission, for example */
+		g_free(path);
+		return;
+	}
+
+	GPtrArray *rows = g_ptr_array_new_with_free_func(g_object_unref);
+	GFileInfo *child;
+	while (rows->len < 2000 && (child = g_file_enumerator_next_file(en, NULL, NULL)) != NULL) {
+		GFile *cf = g_file_get_child(file, g_file_info_get_name(child));
+		char *cp = g_file_get_path(cf);
+		if (cp == NULL) {
+			g_object_unref(child);
+			g_object_unref(cf);
+			continue;
+		}
+		g_file_info_set_attribute_object(child, "standard::file", G_OBJECT(cf));
+		g_file_info_set_attribute_uint32(child, "fhi::depth", depth);
+		g_file_info_set_attribute_string(child, "fhi::parent", path);
+		g_file_info_set_attribute_string(child, "fhi::path", cp);
+		g_free(cp);
+		g_object_unref(cf);
+		g_ptr_array_add(rows, child);
+	}
+	g_object_unref(en);
+
+	/* the sorter looks the folder's own row up here, so register it BEFORE adding the children */
+	g_hash_table_replace(st->peek_info, g_strdup(path), g_object_ref(info));
+	g_hash_table_add(st->expanded, path);   /* the set keeps `path` */
+	g_list_store_splice(st->peeks, g_list_model_get_n_items(G_LIST_MODEL(st->peeks)), 0,
+	                    rows->pdata, rows->len);
+	g_ptr_array_unref(rows);
+	refresh_row_icons(st);   /* the folder icon changes to "open" */
+}
+
+static void
+peek_close(State *st, const char *path_in)
+{
+	char *path = g_strdup(path_in);
+	char *prefix = g_strdup_printf("%s/", path);
+	GHashTable *tables[2] = { st->expanded, st->peek_info };
+	for (int t = 0; t < 2; t++) {
+		GHashTableIter it;
+		gpointer key;
+		g_hash_table_iter_init(&it, tables[t]);
+		while (g_hash_table_iter_next(&it, &key, NULL))
+			if (g_str_has_prefix(key, prefix) || strcmp(key, path) == 0) g_hash_table_iter_remove(&it);
+	}
+	for (guint i = g_list_model_get_n_items(G_LIST_MODEL(st->peeks)); i-- > 0; ) {
+		GFileInfo *row = g_list_model_get_item(G_LIST_MODEL(st->peeks), i);
+		const char *p = g_file_info_get_attribute_string(row, "fhi::path");
+		if (p && g_str_has_prefix(p, prefix)) g_list_store_remove(st->peeks, i);
+		g_object_unref(row);
+	}
+	g_free(prefix);
+	g_free(path);
+	refresh_row_icons(st);
+}
+
+/* Highlight the row at `pos` and make sure it is on screen */
+static void
+select_row(State *st, guint pos)
+{
+	gtk_single_selection_set_selected(st->selection, pos);
+#if GTK_CHECK_VERSION(4, 10, 0)
+	gtk_widget_activate_action(st->list_view, "list.scroll-to-item", "u", pos);
+#endif
+}
+
+/*
+ * Right arrow: open the highlighted folder (or step into it when already open).
+ * Left arrow:  close it (or, on a file inside a peeked folder, jump to that folder).
+ */
+static void
+peek_key(State *st, gboolean open)
+{
+	GFileInfo *info = gtk_single_selection_get_selected_item(st->selection);   /* not ours */
+	if (info == NULL) return;
+	char *path = row_path(info);
+	if (path == NULL) return;   /* ghost */
+	gboolean is_open = g_hash_table_contains(st->expanded, path);
+	guint pos = gtk_single_selection_get_selected(st->selection);
+	guint n = g_list_model_get_n_items(G_LIST_MODEL(st->selection));
+
+	if (open) {
+		if (!is_open) peek_open(st, info);
+		else if (pos + 1 < n) select_row(st, pos + 1);
+	} else if (is_open) {
+		peek_close(st, path);
+	} else if (row_depth(info) > 0) {
+		const char *parent = g_file_info_get_attribute_string(info, "fhi::parent");
+		for (guint i = 0; parent && i < pos; i++) {
+			GFileInfo *row = g_list_model_get_item(G_LIST_MODEL(st->selection), i);
+			char *rp = row_path(row);
+			gboolean hit = g_strcmp0(rp, parent) == 0;
+			g_free(rp);
+			g_object_unref(row);
+			if (hit) {
+				select_row(st, i);
+				break;
+			}
+		}
+	}
+	g_free(path);
+}
+
+/*
+ * After the files of the current folder were (re)loaded: point the sorter at the new
+ * rows of the opened folders, and close peeks whose folder has disappeared.
+ */
+static void
+peek_refresh(State *st)
+{
+	if (g_hash_table_size(st->expanded) == 0) return;
+	GFile *dir = gtk_directory_list_get_file(st->dir_list);
+	if (dir == NULL || gtk_directory_list_is_loading(st->dir_list)) return;
+	char *cwd = g_file_get_path(dir);
+	if (cwd == NULL) return;
+
+	GHashTable *seen = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	GListModel *model = G_LIST_MODEL(st->dir_list);
+	guint n = g_list_model_get_n_items(model);
+	for (guint i = 0; i < n; i++) {
+		GFileInfo *info = g_list_model_get_item(model, i);
+		char *path = g_build_filename(cwd, g_file_info_get_name(info), NULL);
+		if (g_hash_table_contains(st->expanded, path)) {
+			g_hash_table_replace(st->peek_info, g_strdup(path), g_object_ref(info));
+			g_hash_table_add(seen, path);
+		} else {
+			g_free(path);
+		}
+		g_object_unref(info);
+	}
+
+	/* opened folders directly inside cwd that are gone now */
+	GPtrArray *gone = g_ptr_array_new_with_free_func(g_free);
+	char *prefix = g_strdup_printf("%s/", cwd);
+	GHashTableIter it;
+	gpointer key;
+	g_hash_table_iter_init(&it, st->expanded);
+	while (g_hash_table_iter_next(&it, &key, NULL))
+		if (g_str_has_prefix(key, prefix) && strchr((char *)key + strlen(prefix), '/') == NULL &&
+		    !g_hash_table_contains(seen, key))
+			g_ptr_array_add(gone, g_strdup(key));
+	for (guint i = 0; i < gone->len; i++) peek_close(st, gone->pdata[i]);
+
+	gtk_sorter_changed(st->sorter, GTK_SORTER_CHANGE_DIFFERENT);
+	g_ptr_array_unref(gone);
+	g_hash_table_unref(seen);
+	g_free(prefix);
+	g_free(cwd);
+}
+
+/*
+ * Run `line` (a command ending in \r) in the shell without destroying what the
+ * user has typed: zsh/.zshrc binds ESC [ 7000 ~ to "push-line", which puts the
+ * half-typed command aside and brings it back at the next prompt. Focus stays
+ * where it was (the file list, normally).
+ */
+static void
+run_in_shell(State *st, const char *line)
+{
+	GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(st->window));
+	type_into_terminal(st, "\033[7000~");
+	type_into_terminal(st, line);
+	if (focus != NULL) gtk_widget_grab_focus(focus);
+}
+
 /*
  * Enter (or double click) on a row of the file list.
  * GtkListView emits "activate" with the row number ("position").
@@ -519,7 +835,7 @@ on_row_activated(GtkListView *view, guint position, gpointer user_data)
 				char *quoted = g_shell_quote(path); /* 'my folder' is safe to type */
 				/* "\r" is what the Enter key sends */
 				char *text = g_strdup_printf("cd -- %s\r", quoted);
-				type_into_terminal(st, text);
+				run_in_shell(st, text);
 				g_free(text);
 				g_free(quoted);
 				g_free(path);
@@ -624,8 +940,13 @@ on_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode,
 			glong len = g_utf8_strlen(gtk_editable_get_text(e), -1);
 			if (len > 0) gtk_editable_delete_text(e, len - 1, -1);
 		} else if (shell_is_foreground(st)) {
-			type_into_terminal(st, "cd -- ..\r");
+			run_in_shell(st, "cd -- ..\r");
 		}
+		return TRUE;
+	}
+	/* Right / Left in the file list: open / close a folder in place ("peek") */
+	if (in_list && modifiers == 0 && (keyval == GDK_KEY_Right || keyval == GDK_KEY_Left)) {
+		peek_key(st, keyval == GDK_KEY_Right);
 		return TRUE;
 	}
 	if (in_list && keyval == GDK_KEY_r && modifiers == GDK_CONTROL_MASK) {
@@ -1283,7 +1604,8 @@ build_cheat_page(State *st, GtkWidget *stack)
 		{ "Shift + ←", "Move to the file list" },
 		{ "Shift + →", "Move to the terminal" },
 		{ "↑  ↓", "Move through the files (file list)" },
-		{ "Enter", "Open the file, or cd into the folder (file list)" },
+		{ "Enter", "Open the file, or cd into the folder; your typed command is kept (file list)" },
+		{ "→ / ←", "Open / close the highlighted folder in place (file list)" },
 		{ "Backspace", "Go up one folder (cd ..) (file list)" },
 		{ "Shift + Enter", "Type the file's path onto the command line (file list)" },
 		{ "Double click", "Same as Enter" },
@@ -1583,6 +1905,9 @@ activate(GtkApplication *app, gpointer user_data)
 	st->roles = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
 	st->bound_rows = g_hash_table_new(g_direct_hash, g_direct_equal);
 	st->ghosts = g_list_store_new(G_TYPE_FILE_INFO);
+	st->peeks = g_list_store_new(G_TYPE_FILE_INFO);
+	st->expanded = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	st->peek_info = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_object_unref);
 
 	/* Settings, then the style sheet that depends on them (see apply_all) */
 	settings_defaults(&st->cfg);
@@ -1650,7 +1975,7 @@ activate(GtkApplication *app, gpointer user_data)
 
 	/* File list of the home directory */
 	GFile *home = g_file_new_for_path(g_get_home_dir());
-	GtkDirectoryList *dir_list = gtk_directory_list_new("standard::name,standard::display-name,standard::icon,standard::type,standard::size,time::modified,time::created", home);
+	GtkDirectoryList *dir_list = gtk_directory_list_new(FHI_ATTRS, home);
 	/* watch the folder, so files created or deleted by commands show up by themselves */
 	gtk_directory_list_set_monitored(dir_list, TRUE);
 	g_object_unref(home);
@@ -1670,6 +1995,7 @@ activate(GtkApplication *app, gpointer user_data)
 	GListStore *sources = g_list_store_new(G_TYPE_OBJECT);   /* holds the two models */
 	g_list_store_append(sources, dir_list);
 	g_list_store_append(sources, st->ghosts);
+	g_list_store_append(sources, st->peeks);
 	GtkFlattenListModel *merged = gtk_flatten_list_model_new(G_LIST_MODEL(sources));
 
 	/* dotfiles can be hidden from the menu; the filter is re-run by apply_all() */
