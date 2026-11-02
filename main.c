@@ -95,6 +95,8 @@ typedef struct {
 	const FhiLlmTool *llm;           /* the assistant in front of the terminal, NULL if none */
 	pid_t llm_pid;
 	FhiLlmWatch *llm_watch;          /* looks for files it creates or edits */
+	GHashTable *marked;              /* full paths of the files marked with Space (a set) */
+	GtkWidget *mark_label;           /* "3 selected" under the list */
 	GHashTable *llm_act;             /* path (relative to the list's folder) -> LlmAct, shown as lit rows */
 	guint llm_tick;
 	GtkWidget *llm_label;            /* "Claude Code" under the list while one runs */
@@ -260,6 +262,11 @@ apply_row_style(State *st, GtkWidget *box)
 		gtk_widget_remove_css_class(box, role_class[i]);
 	gtk_widget_remove_css_class(box, "fhi-llm-new");
 	gtk_widget_remove_css_class(box, "fhi-llm-mod");
+	gtk_widget_remove_css_class(box, "fhi-marked");
+
+	const char *own_path = g_object_get_data(G_OBJECT(box), "fhi-path");
+	if (own_path && g_hash_table_size(st->marked) > 0 && g_hash_table_contains(st->marked, own_path))
+		gtk_widget_add_css_class(box, "fhi-marked");   /* on top of any other color */
 
 	const char *name = g_object_get_data(G_OBJECT(box), "fhi-name");
 	FhiRole role = name ? GPOINTER_TO_INT(g_hash_table_lookup(st->roles, name)) : FHI_ROLE_NONE;
@@ -280,6 +287,104 @@ refresh_all_rows(State *st)
 	while (g_hash_table_iter_next(&it, &box, NULL)) apply_row_style(st, box);
 }
 
+/* ---- marking files (Space) ------------------------------------------------ */
+
+static int
+cmp_strings(gconstpointer a, gconstpointer b)
+{
+	return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* The marked files that still exist, sorted (new array of new strings; may be empty) */
+static GPtrArray *
+marked_paths(State *st)
+{
+	GPtrArray *out = g_ptr_array_new_with_free_func(g_free);
+	GHashTableIter it;
+	gpointer key;
+	g_hash_table_iter_init(&it, st->marked);
+	while (g_hash_table_iter_next(&it, &key, NULL))
+		if (g_file_test(key, G_FILE_TEST_EXISTS | G_FILE_TEST_IS_SYMLINK)) g_ptr_array_add(out, g_strdup(key));
+	g_ptr_array_sort(out, cmp_strings);
+	return out;
+}
+
+/* The set of marks changed: recolor the rows and update the counter */
+static void
+marks_changed(State *st)
+{
+	guint n = g_hash_table_size(st->marked);
+	if (n > 0) {
+		char *text = g_strdup_printf("%u selected", n);
+		gtk_label_set_text(GTK_LABEL(st->mark_label), text);
+		g_free(text);
+	}
+	gtk_widget_set_visible(st->mark_label, n > 0);
+	refresh_all_rows(st);
+}
+
+static void
+marks_clear(State *st)
+{
+	if (g_hash_table_size(st->marked) == 0) return;
+	g_hash_table_remove_all(st->marked);
+	marks_changed(st);
+}
+
+/* Is this row's file marked? */
+static gboolean
+info_is_marked(State *st, GFileInfo *info)
+{
+	char *path = row_path(info);
+	gboolean yes = path && g_hash_table_contains(st->marked, path);
+	g_free(path);
+	return yes;
+}
+
+/* Space: mark or unmark the highlighted file and step down to the next one */
+static void
+toggle_mark_selected(State *st)
+{
+	GFileInfo *info = gtk_single_selection_get_selected_item(st->selection);   /* not ours */
+	if (info == NULL) return;
+	char *path = row_path(info);   /* NULL for a ghost row */
+	if (path == NULL) return;
+	if (!g_hash_table_remove(st->marked, path)) g_hash_table_add(st->marked, g_strdup(path));
+	g_free(path);
+	marks_changed(st);
+
+	guint pos = gtk_single_selection_get_selected(st->selection);
+	if (pos + 1 < g_list_model_get_n_items(G_LIST_MODEL(st->selection)))
+		gtk_single_selection_set_selected(st->selection, pos + 1);
+}
+
+/* Ctrl+A: mark everything the list shows (or unmark all if everything already is) */
+static void
+mark_all_visible(State *st)
+{
+	GListModel *m = G_LIST_MODEL(st->selection);
+	guint n = g_list_model_get_n_items(m);
+	gboolean all = TRUE;
+	for (guint i = 0; i < n && all; i++) {
+		GFileInfo *info = g_list_model_get_item(m, i);
+		char *path = row_path(info);
+		if (path && !g_hash_table_contains(st->marked, path)) all = FALSE;
+		g_free(path);
+		g_object_unref(info);
+	}
+	for (guint i = 0; i < n; i++) {
+		GFileInfo *info = g_list_model_get_item(m, i);
+		char *path = row_path(info);
+		if (path) {
+			if (all) g_hash_table_remove(st->marked, path);
+			else g_hash_table_add(st->marked, g_strdup(path));   /* the set keeps a path it has */
+		}
+		g_free(path);
+		g_object_unref(info);
+	}
+	marks_changed(st);
+}
+
 /*
  * Dragging a row out of the window (to a browser, Discord, a file manager...).
  * We offer the file as a GdkFileList, which GTK turns into the standard
@@ -295,11 +400,60 @@ on_drag_prepare(GtkDragSource *source, double x, double y, gpointer user_data)
 	GFile *file = G_FILE(g_file_info_get_attribute_object(info, "standard::file"));
 	if (file == NULL) return NULL;
 
-	GFile *files[1] = { file };
-	GdkFileList *list = gdk_file_list_new_from_array(files, 1);
+	/*
+	 * Like a file manager: with files marked, the drag carries ALL of them. The highlighted row
+	 * looks selected too (it is the blue one, usually the row after the last Space), so grabbing
+	 * it joins the marked files; grabbing any other row drags just that row.
+	 */
+	State *st = user_data;
+	GdkFileList *list = NULL;
+	if (st && g_hash_table_size(st->marked) > 0 &&
+	    (info_is_marked(st, info) || info == gtk_single_selection_get_selected_item(st->selection))) {
+		GPtrArray *paths = marked_paths(st);
+		char *own = row_path(info);
+		if (own) {
+			gboolean listed = FALSE;
+			for (guint i = 0; i < paths->len && !listed; i++) listed = strcmp(paths->pdata[i], own) == 0;
+			if (!listed) g_ptr_array_add(paths, own);
+			else g_free(own);
+		}
+		GPtrArray *files = g_ptr_array_new_with_free_func(g_object_unref);
+		for (guint i = 0; i < paths->len; i++) g_ptr_array_add(files, g_file_new_for_path(paths->pdata[i]));
+		if (files->len > 1) {
+			list = gdk_file_list_new_from_array((GFile **)files->pdata, files->len);
+			g_object_set_data(G_OBJECT(source), "fhi-multi", GINT_TO_POINTER(1));   /* see on_drag_end */
+			g_object_set_data(G_OBJECT(source), "fhi-cancelled", NULL);
+		}
+		g_ptr_array_unref(files);
+		g_ptr_array_unref(paths);
+	}
+	if (list == NULL) {
+		GFile *one[1] = { file };
+		list = gdk_file_list_new_from_array(one, 1);
+		g_object_set_data(G_OBJECT(source), "fhi-multi", NULL);
+	}
 	GdkContentProvider *provider = gdk_content_provider_new_typed(GDK_TYPE_FILE_LIST, list);
 	g_object_unref(list);
 	return provider;
+}
+
+/* The drop did not happen (nobody took it, Esc): the marks stay so you can try again */
+static gboolean
+on_drag_cancel(GtkDragSource *source, GdkDrag *drag, GdkDragCancelReason reason, gpointer user_data)
+{
+	g_object_set_data(G_OBJECT(source), "fhi-cancelled", GINT_TO_POINTER(1));
+	return FALSE;   /* GTK's own "snap back" animation */
+}
+
+/* A drag of several files was dropped: that is what the marks were for, so forget them */
+static void
+on_drag_end(GtkDragSource *source, GdkDrag *drag, gboolean delete_data, gpointer user_data)
+{
+	State *st = user_data;
+	if (g_object_get_data(G_OBJECT(source), "fhi-multi") && !g_object_get_data(G_OBJECT(source), "fhi-cancelled")) {
+		g_object_set_data(G_OBJECT(source), "fhi-multi", NULL);
+		marks_clear(st);
+	}
 }
 
 /* While dragging, the pointer carries a picture of the row */
@@ -327,8 +481,10 @@ setup_item(GtkSignalListItemFactory *factory, GtkListItem *item, gpointer user_d
 
 	GtkDragSource *drag = gtk_drag_source_new();
 	gtk_drag_source_set_actions(drag, GDK_ACTION_COPY);   /* never move or delete the original */
-	g_signal_connect(drag, "prepare", G_CALLBACK(on_drag_prepare), NULL);
+	g_signal_connect(drag, "prepare", G_CALLBACK(on_drag_prepare), user_data);
 	g_signal_connect(drag, "drag-begin", G_CALLBACK(on_drag_begin), NULL);
+	g_signal_connect(drag, "drag-cancel", G_CALLBACK(on_drag_cancel), NULL);
+	g_signal_connect(drag, "drag-end", G_CALLBACK(on_drag_end), user_data);
 	gtk_widget_add_controller(box, GTK_EVENT_CONTROLLER(drag));
 
 	gtk_list_item_set_child(item, box);
@@ -373,7 +529,7 @@ bind_item(GtkSignalListItemFactory *factory, GtkListItem *item, gpointer user_da
 	 * update_preview() can recolor it later without GTK asking again. */
 	g_object_set_data_full(G_OBJECT(box), "fhi-name",
 	                       peeked ? NULL : g_strdup(g_file_info_get_name(info)), g_free);   /* peeked rows are never highlighted */
-	g_object_set_data_full(G_OBJECT(box), "fhi-path", peeked ? row_path(info) : NULL, g_free);
+	g_object_set_data_full(G_OBJECT(box), "fhi-path", row_path(info), g_free);   /* NULL for ghosts */
 	g_hash_table_add(st->bound_rows, box);
 
 	if (g_file_info_get_attribute_boolean(info, "fhi::ghost"))
@@ -1302,36 +1458,61 @@ paste_selected_path(State *st)
 	Foreground fg = foreground_kind(st);
 	if (fg == FG_OTHER) return;
 
-	/* "selected item" is owned by the selection model: do not unref it */
-	GFileInfo *info = gtk_single_selection_get_selected_item(st->selection);
-	if (info == NULL) return;
-	GFile *file = G_FILE(g_file_info_get_attribute_object(info, "standard::file"));
-	if (file == NULL) return;
-	char *path = g_file_get_path(file);
-	if (path == NULL) return;
+	/* the marked files, or just the highlighted one */
+	GPtrArray *paths = marked_paths(st);
+	if (paths->len == 0) {
+		/* "selected item" is owned by the selection model: do not unref it */
+		GFileInfo *info = gtk_single_selection_get_selected_item(st->selection);
+		char *path = info ? row_path(info) : NULL;
+		if (path) g_ptr_array_add(paths, path);
+	}
+	/* a path with control characters would be typed as keys */
+	for (guint i = paths->len; i-- > 0; )
+		for (const char *c = paths->pdata[i]; *c; c++)
+			if ((unsigned char)*c < 0x20 || *c == 0x7f) {
+				g_ptr_array_remove_index(paths, i);
+				break;
+			}
+	if (paths->len == 0) {
+		g_ptr_array_unref(paths);
+		return;
+	}
 
+	VteTerminal *term = VTE_TERMINAL(st->terminal);
+	GString *text = g_string_new(NULL);
 	if (fg == FG_LLM) {
 		const FhiLlmTool *tool = fhi_llm_detect(foreground_pid(st));
 		char *cwd = fhi_llm_cwd(foreground_pid(st));   /* the assistant's own folder, where @ paths start */
-		gboolean is_dir = g_file_info_get_file_type(info) == G_FILE_TYPE_DIRECTORY;
-		char *text = tool ? fhi_llm_format_path(tool, path, is_dir, cwd) : NULL;
-		if (text) vte_terminal_paste_text(VTE_TERMINAL(st->terminal), text);
-		g_free(text);
+		for (guint i = 0; tool && i < paths->len; i++) {
+			char *one = fhi_llm_format_path(tool, paths->pdata[i], g_file_test(paths->pdata[i], G_FILE_TEST_IS_DIR), cwd);
+			if (one) g_string_append(text, one);   /* each ends with a space */
+			g_free(one);
+		}
 		g_free(cwd);
+		if (text->len > 0) vte_terminal_paste_text(term, text->str);
 	} else if (fg == FG_SHELL) {
-		char *quoted = g_shell_quote(path);
-		char *text = g_strdup_printf(" %s ", quoted); /* trailing space for the next word */
-		type_into_terminal(st, text);
-		g_free(text);
-		g_free(quoted);
+		g_string_append_c(text, ' ');
+		for (guint i = 0; i < paths->len; i++) {
+			char *quoted = g_shell_quote(paths->pdata[i]);
+			g_string_append_printf(text, "%s ", quoted);   /* trailing space for the next word */
+			g_free(quoted);
+		}
+		type_into_terminal(st, text->str);
 	} else if (fg == FG_PYTHON) {
-		char *lit = python_literal(path);
-		vte_terminal_paste_text(VTE_TERMINAL(st->terminal), lit);
-		g_free(lit);
-	} else {
-		vte_terminal_paste_text(VTE_TERMINAL(st->terminal), path);
+		for (guint i = 0; i < paths->len; i++) {
+			char *lit = python_literal(paths->pdata[i]);
+			g_string_append_printf(text, "%s%s", i ? ", " : "", lit);
+			g_free(lit);
+		}
+		vte_terminal_paste_text(term, text->str);
+	} else {   /* vim / nano: one path per line */
+		for (guint i = 0; i < paths->len; i++)
+			g_string_append_printf(text, "%s%s", i ? "\n" : "", (char *)paths->pdata[i]);
+		vte_terminal_paste_text(term, text->str);
 	}
-	g_free(path);
+	g_string_free(text, TRUE);
+	g_ptr_array_unref(paths);
+	marks_clear(st);   /* done with them: no need to unmark by hand */
 
 	/* The user will want to keep typing, so go back to the terminal */
 	gtk_widget_grab_focus(st->terminal);
@@ -1808,6 +1989,19 @@ on_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode,
 		}
 		return TRUE;
 	}
+	/* Space marks the highlighted file, Ctrl+A marks everything shown, Esc clears the marks */
+	if (in_list && modifiers == 0 && keyval == GDK_KEY_space) {
+		toggle_mark_selected(st);
+		return TRUE;
+	}
+	if (in_list && modifiers == GDK_CONTROL_MASK && (keyval == GDK_KEY_a || keyval == GDK_KEY_A)) {
+		mark_all_visible(st);
+		return TRUE;
+	}
+	if (in_list && modifiers == 0 && keyval == GDK_KEY_Escape && g_hash_table_size(st->marked) > 0) {
+		marks_clear(st);
+		return TRUE;
+	}
 	/* Right / Left in the file list: open / close a folder in place ("peek") */
 	if (in_list && modifiers == 0 && (keyval == GDK_KEY_Right || keyval == GDK_KEY_Left)) {
 		peek_key(st, keyval == GDK_KEY_Right);
@@ -2256,6 +2450,9 @@ apply_theme(State *st)
 	    ".fhi-remove { background: alpha(%s, 0.40); }"
 	    ".fhi-llm-new { background: alpha(%s, 0.55); }"
 	    ".fhi-llm-mod { background: alpha(%s, 0.45); }"
+	    ".fhi-marked { box-shadow: inset 4px 0 0 currentColor; background-image: linear-gradient(alpha(currentColor, 0.14), alpha(currentColor, 0.14)); }"
+	    ".fhi-marked label { font-weight: bold; }"
+	    ".fhi-marklabel { font-size: 8pt; font-weight: bold; padding: 4px 8px; }"
 	    ".fhi-ghost label { font-style: italic; }"
 	    ".fhi-icon   { font-family: '" FHI_ICON_FONT "'; min-width: 1.4em; }"
 	    ".fhi-info   { font-size: %dpt; padding: 4px 8px; opacity: 0.85; }"
@@ -2971,8 +3168,11 @@ build_cheat_page(State *st, GtkWidget *stack)
 		{ "Enter", "Open the file, or cd into the folder; your typed command is kept. In vim / nano a text file is opened there instead, after saving the current one (file list)" },
 		{ "→ / ←", "Open / close the highlighted folder in place (file list)" },
 		{ "Backspace", "Go up one folder (cd ..) (file list)" },
-		{ "Shift + Enter", "Paste the file's path into the terminal: quoted for the shell, plain in vim / nano, a string in python (file list)" },
+		{ "Space", "Mark / unmark the file (file list). Shift + Enter then pastes all marked files, and dragging one drags them all. Ctrl + A marks everything shown, Esc clears the marks (they also clear after a paste or drop)" },
+		{ "Shift + Enter", "Paste the file's path into the terminal: quoted for the shell, plain in vim / nano, a string in python, @file for AI assistants (file list)" },
 		{ "Ctrl + Shift + C / V", "Copy the terminal selection / paste into the terminal" },
+		{ "Ctrl + Shift + T / W", "New tab / close the tab (its shell ends)" },
+		{ "Ctrl + PageUp / PageDown", "Previous / next tab (also Ctrl + Tab)" },
 		{ "Double click", "Same as Enter" },
 		{ "Drag a file", "Drop it into a browser, Discord, a file manager... (copies it)" },
 		{ "Shift + ↑ / ↓", "Next / previous sort mode (file list)" },
@@ -3314,6 +3514,7 @@ activate(GtkApplication *app, gpointer user_data)
 	st->notebook = gtk_notebook_new();   /* the tabs; see tab_new() */
 	st->roles = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
 	st->llm_act = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	st->marked = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
 	st->bound_rows = g_hash_table_new(g_direct_hash, g_direct_equal);
 	st->ghosts = g_list_store_new(G_TYPE_FILE_INFO);
 	st->peeks = g_list_store_new(G_TYPE_FILE_INFO);
@@ -3429,8 +3630,13 @@ activate(GtkApplication *app, gpointer user_data)
 	st->llm_label = gtk_label_new(NULL);   /* "Claude Code" while an assistant runs */
 	gtk_widget_add_css_class(st->llm_label, "fhi-sort");
 	gtk_widget_set_visible(st->llm_label, FALSE);
+	st->mark_label = gtk_label_new(NULL);   /* "3 selected" while files are marked */
+	gtk_widget_add_css_class(st->mark_label, "fhi-marklabel");
+	gtk_widget_set_tooltip_text(st->mark_label, "Space marks files, Shift+Enter pastes them all, dragging one drags them all.\nEsc clears the marks.");
+	gtk_widget_set_visible(st->mark_label, FALSE);
 	GtkWidget *bottom = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
 	gtk_box_append(GTK_BOX(bottom), st->info_label);
+	gtk_box_append(GTK_BOX(bottom), st->mark_label);
 	gtk_box_append(GTK_BOX(bottom), st->llm_label);
 	gtk_box_append(GTK_BOX(bottom), st->sort_label);
 

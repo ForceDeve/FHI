@@ -4,7 +4,7 @@
 the folder you're in and highlights the files the command you're typing would affect, before you
 press Enter.
 
-> **Beta (0.1.4):** usable, but little tested outside the author's machine.
+> **Beta (0.1.5):** usable, but little tested outside the author's machine.
 
 ## Features
 
@@ -26,9 +26,23 @@ press Enter.
 - **Editor integration** – with vim or nano open, `Enter` on a text or source file saves what you
   were editing and continues in the new file (vim: `:update | edit`; nano: a new buffer). If the
   save fails, for example a read-only file, vim stays where it is and nothing is lost.
-- **Folder peeking** – `→` opens the highlighted folder inside the list (indented, nesting works,
+- **Multi-select** – `Space` marks the highlighted file (marked rows get a bar and bold text, a
+  counter shows how many) and steps to the next one; `Ctrl+A` marks everything shown, `Esc` clears.
+  `Shift+Enter` then pastes **all** marked files (several quoted paths in the shell, several
+  `@mentions` in an AI assistant, one per line in vim / nano), and dragging any marked file drags the
+  whole selection into another app (grabbing the highlighted row works too, like in a file manager). Marks survive `cd`, so you can collect files from several folders, and they clear by themselves once pasted or dropped.
+ – `→` opens the highlighted folder inside the list (indented, nesting works,
   no `cd`); `←` closes it, or jumps from an entry back to its folder. `Enter` still `cd`s, and keeps
   whatever you were typing on the command line.
+- **Tabs** – `Ctrl+Shift+T` opens a tab (in the folder the list shows), `Ctrl+Shift+W` closes it,
+  `Ctrl+PageUp/PageDown` or `Ctrl+Tab` switch. The tab bar only appears with two or more tabs, tabs
+  are named after their folder, and the file list, preview and assistant / ssh panels follow the tab
+  in front. `exit` closes a tab; the last one closes the window.
+- **tmux** – with tmux in front, the file list follows the pane that has focus: its folder, and the
+  program in it (an assistant or ssh in one pane lights up the matching panel). Moving between panes
+  updates the list within half a second. Needs the `tmux` program in your PATH. `Enter` on a folder
+  and `Backspace` (`cd`) only work in panes whose shell FHI started (a tmux server launched from an
+  FHI terminal); other panes still get `Shift+Enter` pasting.
 - **AI coding assistants** – FHI recognises Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, Cursor
   Agent, Amp, Droid and the open source ones: opencode, Qwen Code, Kimi CLI, Kilo Code, Mistral Vibe,
   Continue, Crush, aider, goose, Cline, OpenHands, Plandex, Open Interpreter, gptme, RA.Aid, plus
