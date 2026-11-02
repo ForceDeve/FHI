@@ -14,6 +14,7 @@
 #include "filetype.h"
 #include "gitinfo.h"
 #include "sshinfo.h"
+#include "llmcli.h"
 #include "theme.h"
 #include <strings.h>
 
@@ -79,6 +80,14 @@ typedef struct {
 	char *unsupported_shell;         /* name of that shell, NULL while all is fine */
 	FhiSsh *ssh;                     /* the ssh session in front of the terminal, NULL if none */
 	GtkWidget *ssh_card;             /* session info, over the dimmed panel */
+
+	/* --- AI assistant in the terminal (claude, codex, aider...), see llmcli.c --- */
+	const FhiLlmTool *llm;           /* the assistant in front of the terminal, NULL if none */
+	pid_t llm_pid;
+	FhiLlmWatch *llm_watch;          /* looks for files it creates or edits */
+	GHashTable *llm_act;             /* path (relative to the list's folder) -> LlmAct, shown as lit rows */
+	guint llm_tick;
+	GtkWidget *llm_label;            /* "Claude Code" under the list while one runs */
 	GtkWidget *last_pane;            /* list or terminal: where focus goes after the menu closes */
 	GtkWidget *font_btn;             /* terminal font chooser */
 	/* theme page widgets, kept so they can follow the settings (see theme_sync_widgets) */
@@ -190,17 +199,58 @@ static const char *const role_class[] = {
 	NULL, "fhi-touch", "fhi-create", "fhi-dest", "fhi-remove"
 };
 
+/* A file an AI assistant just created or edited; the row stays lit for a few seconds */
+typedef struct {
+	gint64 time;        /* g_get_monotonic_time() of the last change */
+	gboolean created;
+} LlmAct;
+
+#define LLM_LIT_SECONDS 12
+
+/* Path of the folder the list shows (new string, free it), NULL if unknown */
+static char *
+list_dir_path(State *st)
+{
+	GFile *dir = gtk_directory_list_get_file(st->dir_list);   /* not ours */
+	return dir ? g_file_get_path(dir) : NULL;
+}
+
+/* The assistant's activity on the file a row shows, NULL if none. */
+static const LlmAct *
+row_llm_act(State *st, GtkWidget *box)
+{
+	if (g_hash_table_size(st->llm_act) == 0) return NULL;
+	const char *name = g_object_get_data(G_OBJECT(box), "fhi-name");
+	if (name) return g_hash_table_lookup(st->llm_act, name);
+
+	/* a row inside a peeked folder: its key is the path below the list's folder */
+	const char *path = g_object_get_data(G_OBJECT(box), "fhi-path");
+	if (path == NULL) return NULL;
+	const LlmAct *act = NULL;
+	char *dir = list_dir_path(st);
+	if (dir && g_str_has_prefix(path, dir) && path[strlen(dir)] == '/')
+		act = g_hash_table_lookup(st->llm_act, path + strlen(dir) + 1);
+	g_free(dir);
+	return act;
+}
+
 /* Give one row the color that matches what the typed command does to its file. */
 static void
 apply_row_style(State *st, GtkWidget *box)
 {
 	for (guint i = 1; i < G_N_ELEMENTS(role_class); i++)
 		gtk_widget_remove_css_class(box, role_class[i]);
+	gtk_widget_remove_css_class(box, "fhi-llm-new");
+	gtk_widget_remove_css_class(box, "fhi-llm-mod");
 
 	const char *name = g_object_get_data(G_OBJECT(box), "fhi-name");
-	if (name == NULL) return;
-	FhiRole role = GPOINTER_TO_INT(g_hash_table_lookup(st->roles, name));
-	if (role != FHI_ROLE_NONE) gtk_widget_add_css_class(box, role_class[role]);
+	FhiRole role = name ? GPOINTER_TO_INT(g_hash_table_lookup(st->roles, name)) : FHI_ROLE_NONE;
+	if (role != FHI_ROLE_NONE) {   /* what the typed command does wins over the assistant's work */
+		gtk_widget_add_css_class(box, role_class[role]);
+		return;
+	}
+	const LlmAct *act = row_llm_act(st, box);
+	if (act) gtk_widget_add_css_class(box, act->created ? "fhi-llm-new" : "fhi-llm-mod");
 }
 
 static void
@@ -305,6 +355,7 @@ bind_item(GtkSignalListItemFactory *factory, GtkListItem *item, gpointer user_da
 	 * update_preview() can recolor it later without GTK asking again. */
 	g_object_set_data_full(G_OBJECT(box), "fhi-name",
 	                       peeked ? NULL : g_strdup(g_file_info_get_name(info)), g_free);   /* peeked rows are never highlighted */
+	g_object_set_data_full(G_OBJECT(box), "fhi-path", peeked ? row_path(info) : NULL, g_free);
 	g_hash_table_add(st->bound_rows, box);
 
 	if (g_file_info_get_attribute_boolean(info, "fhi::ghost"))
@@ -898,6 +949,65 @@ peek_refresh(State *st)
 	g_free(cwd);
 }
 
+static int
+cmp_path_len(gconstpointer a, gconstpointer b)
+{
+	return (int)strlen(*(char *const *)a) - (int)strlen(*(char *const *)b);
+}
+
+/*
+ * Read the opened ("peeked") folders again from disk. peek_open() lists a folder once, so
+ * files that appear inside one later (an assistant writing src/new.c while src/ is open)
+ * would not show up. Outer folders are reopened first, so nesting survives.
+ */
+static void
+peek_rescan(State *st)
+{
+	if (g_hash_table_size(st->expanded) == 0) return;
+
+	GPtrArray *paths = g_ptr_array_new_with_free_func(g_free);
+	GHashTable *infos = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_object_unref);
+	GHashTableIter it;
+	gpointer key, value;
+	g_hash_table_iter_init(&it, st->peek_info);
+	while (g_hash_table_iter_next(&it, &key, &value)) {
+		g_ptr_array_add(paths, g_strdup(key));
+		g_hash_table_insert(infos, g_strdup(key), g_object_ref(value));
+	}
+	g_ptr_array_sort(paths, cmp_path_len);
+
+	/* keep the highlighted row on the same file */
+	GFileInfo *sel = gtk_single_selection_get_selected_item(st->selection);
+	char *sel_path = sel ? row_path(sel) : NULL;
+	gboolean had_focus = list_has_focus(st);
+
+	peek_clear_all(st);
+	for (guint i = 0; i < paths->len; i++) {
+		GFileInfo *info = g_hash_table_lookup(infos, paths->pdata[i]);
+		if (info) peek_open(st, info);
+	}
+
+	if (sel_path) {
+		GListModel *m = G_LIST_MODEL(st->selection);
+		guint n = g_list_model_get_n_items(m);
+		for (guint i = 0; i < n; i++) {
+			GFileInfo *row = g_list_model_get_item(m, i);
+			char *rp = row_path(row);
+			gboolean hit = g_strcmp0(rp, sel_path) == 0;
+			g_free(rp);
+			g_object_unref(row);
+			if (hit) {
+				select_row(st, i);
+				break;
+			}
+		}
+	}
+	if (had_focus) gtk_widget_grab_focus(st->list_view);
+	g_free(sel_path);
+	g_hash_table_unref(infos);
+	g_ptr_array_unref(paths);
+}
+
 /*
  * Run `line` (a command ending in \r) in the shell without destroying what the
  * user has typed: zsh/.zshrc binds ESC [ 7000 ~ to "push-line", which puts the
@@ -914,7 +1024,7 @@ run_in_shell(State *st, const char *line)
 }
 
 /* Who is in front of the terminal right now? */
-typedef enum { FG_OTHER, FG_SHELL, FG_VIM, FG_NANO, FG_PYTHON } Foreground;
+typedef enum { FG_OTHER, FG_SHELL, FG_VIM, FG_NANO, FG_PYTHON, FG_LLM } Foreground;
 static Foreground foreground_kind(State *st);
 
 /* Is this a file we would edit in a text editor? (source code, config, notes...) */
@@ -1069,6 +1179,7 @@ foreground_kind(State *st)
 	    g_str_has_prefix(comm, "bpython") || g_str_has_prefix(comm, "ptpython"))
 		kind = FG_PYTHON;
 	g_free(comm);
+	if (kind == FG_OTHER && fhi_llm_detect(pgid)) kind = FG_LLM;   /* claude, codex, aider... */
 	return kind;
 }
 
@@ -1112,6 +1223,7 @@ paste_from_clipboard(State *st)
  *   vim     -> the plain path, pasted (bracketed paste: lands in the text in any mode)
  *   nano    -> the plain path, pasted
  *   python  -> a quoted string literal 'path', pasted
+ *   AI assistant (claude, codex...) -> `@relative/path ` where it has @-mentions, else the path
  * Any other program in front: do nothing, we would only type garbage into it.
  */
 static void
@@ -1128,7 +1240,15 @@ paste_selected_path(State *st)
 	char *path = g_file_get_path(file);
 	if (path == NULL) return;
 
-	if (fg == FG_SHELL) {
+	if (fg == FG_LLM) {
+		const FhiLlmTool *tool = fhi_llm_detect(foreground_pid(st));
+		char *cwd = fhi_llm_cwd(foreground_pid(st));   /* the assistant's own folder, where @ paths start */
+		gboolean is_dir = g_file_info_get_file_type(info) == G_FILE_TYPE_DIRECTORY;
+		char *text = tool ? fhi_llm_format_path(tool, path, is_dir, cwd) : NULL;
+		if (text) vte_terminal_paste_text(VTE_TERMINAL(st->terminal), text);
+		g_free(text);
+		g_free(cwd);
+	} else if (fg == FG_SHELL) {
 		char *quoted = g_shell_quote(path);
 		char *text = g_strdup_printf(" %s ", quoted); /* trailing space for the next word */
 		type_into_terminal(st, text);
@@ -1147,6 +1267,112 @@ paste_selected_path(State *st)
 	gtk_widget_grab_focus(st->terminal);
 }
 
+
+/* Remember that `key` (relative to the list's folder) was touched by the assistant */
+static void
+llm_mark(State *st, const char *key, gboolean created)
+{
+	LlmAct *act = g_hash_table_lookup(st->llm_act, key);
+	if (act == NULL) {
+		act = g_new0(LlmAct, 1);
+		g_hash_table_insert(st->llm_act, g_strdup(key), act);
+	}
+	act->time = g_get_monotonic_time();
+	act->created = act->created || created;   /* a file made and then edited is still "new" */
+}
+
+/* The watcher found files the assistant created or edited (runs on the main loop) */
+static void
+on_llm_changes(const char *root, GPtrArray *changes, gpointer user_data)
+{
+	State *st = user_data;
+	char *dir = list_dir_path(st);
+	gboolean rescan = FALSE;
+
+	for (guint i = 0; dir && i < changes->len; i++) {
+		const FhiLlmChange *c = changes->pdata[i];
+		char *abs = g_build_filename(root, c->path, NULL);
+		gsize dl = strlen(dir);
+		if (strncmp(abs, dir, dl) == 0 && abs[dl] == '/' && abs[dl + 1] != '\0') {
+			char *key = g_strdup(abs + dl + 1);
+			if (!c->removed) llm_mark(st, key, c->created);
+			/* every folder above it lights up too, so a change deep inside is visible */
+			char *slash;
+			gboolean first = TRUE;
+			while ((slash = strrchr(key, '/')) != NULL) {
+				*slash = '\0';
+				if (first) {   /* an opened folder lists its files once: read it again */
+					char *folder = g_build_filename(dir, key, NULL);
+					if (g_hash_table_contains(st->expanded, folder)) rescan = TRUE;
+					g_free(folder);
+					first = FALSE;
+				}
+				if (!c->removed) llm_mark(st, key, FALSE);
+			}
+			g_free(key);
+		}
+		g_free(abs);
+	}
+	g_free(dir);
+	g_ptr_array_unref(changes);
+
+	if (rescan) peek_rescan(st);
+	refresh_all_rows(st);
+}
+
+/* Start / stop / poll the watcher for the assistant in front of the terminal; fade old highlights */
+static void
+llm_update(State *st, pid_t pid, gboolean shell_in_front)
+{
+	const FhiLlmTool *tool = (pid > 0 && !shell_in_front) ? fhi_llm_detect(pid) : NULL;
+
+	if (tool == NULL || pid != st->llm_pid) {
+		if (st->llm_watch) {
+			fhi_llm_watch_free(st->llm_watch);
+			st->llm_watch = NULL;
+		}
+		st->llm = NULL;
+		st->llm_pid = 0;
+	}
+	if (tool && st->llm == NULL) {
+		st->llm = tool;
+		st->llm_pid = pid;
+		char *cwd = fhi_llm_cwd(pid);
+		if (cwd) st->llm_watch = fhi_llm_watch_new(cwd, on_llm_changes, st);
+		g_free(cwd);
+		char *text = g_strdup_printf("\uf544 %s", tool->title);
+		gtk_label_set_text(GTK_LABEL(st->llm_label), text);
+		g_free(text);
+		char *tip = g_strdup_printf("%s is running. Files it creates or edits light up in the list.\n"
+		                            "Shift+Enter pastes the highlighted file%s.",
+		                            tool->title, tool->mention ? " as an @mention" : "'s path");
+		gtk_widget_set_tooltip_text(st->llm_label, tip);
+		g_free(tip);
+	}
+	gtk_widget_set_visible(st->llm_label, st->llm != NULL);
+
+	if (st->llm_watch && (st->llm_tick++ % 2 == 0)) {   /* every second */
+		fhi_llm_watch_poll(st->llm_watch);
+		/* Polling fallback for the top level: normally GTK's folder monitor shows new files by
+		 * itself, but if it misses something, compare with the disk and reload (cheap). */
+		if (st->resync_timer == 0) resync_directory(st);
+	}
+
+	/* highlights fade after a while */
+	if (g_hash_table_size(st->llm_act) > 0) {
+		gint64 limit = g_get_monotonic_time() - (gint64)LLM_LIT_SECONDS * G_USEC_PER_SEC;
+		gboolean faded = FALSE;
+		GHashTableIter it;
+		gpointer value;
+		g_hash_table_iter_init(&it, st->llm_act);
+		while (g_hash_table_iter_next(&it, NULL, &value))
+			if (((LlmAct *)value)->time < limit) {
+				g_hash_table_iter_remove(&it);
+				faded = TRUE;
+			}
+		if (faded) refresh_all_rows(st);
+	}
+}
 
 /*
  * Every half second: is a shell other than zsh, or an ssh session, running in the
@@ -1185,6 +1411,7 @@ check_shell_support(gpointer user_data)
 		st->ssh = NULL;
 	}
 	fhi_ssh_card_update(st->ssh_card, st->ssh);
+	llm_update(st, pid, pid == st->shell_pid || st->ssh != NULL);
 
 	gboolean dim = bad != NULL || st->ssh != NULL;
 	gtk_widget_set_sensitive(st->left_panel, !dim);
@@ -1328,7 +1555,7 @@ on_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode,
 
 /* ======================================================================== */
 /* Hamburger menu: settings, theme, cheat sheet, file info                    */
-/* ======================================================================== */,
+/* ======================================================================== */
 
 static void
 settings_defaults(Settings *c)
@@ -1669,6 +1896,8 @@ apply_theme(State *st)
 	    ".fhi-create { background: alpha(%s, 0.40); }"
 	    ".fhi-dest   { background: alpha(%s, 0.40); }"
 	    ".fhi-remove { background: alpha(%s, 0.40); }"
+	    ".fhi-llm-new { background: alpha(%s, 0.55); }"
+	    ".fhi-llm-mod { background: alpha(%s, 0.45); }"
 	    ".fhi-ghost label { font-style: italic; }"
 	    ".fhi-icon   { font-family: '" FHI_ICON_FONT "'; min-width: 1.4em; }"
 	    ".fhi-info   { font-size: %dpt; padding: 4px 8px; opacity: 0.85; }"
@@ -1688,7 +1917,7 @@ apply_theme(State *st)
 	    ".fhi-square, .fhi-square > border, .fhi-square scrolledwindow { border-radius: 0; }"
 	    ".fhi-sort   { font-size: 8pt; opacity: 0.5; padding: 4px 8px; }"
 	    ".fhi-swatch { min-width: 14px; min-height: 14px; border-radius: 3px; }",
-	    col[0], col[1], col[2], col[3], c->info_font);
+	    col[0], col[1], col[2], col[3], col[1], col[0], c->info_font);
 	gboolean composited = display_composited();
 	char *themecss = fhi_theme_css(t, composited);   /* after ours: same rule, last one wins */
 	char *all = g_strconcat(css, themecss, NULL);
@@ -2735,6 +2964,7 @@ activate(GtkApplication *app, gpointer user_data)
 	st->window = window;
 	st->terminal = terminal;
 	st->roles = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	st->llm_act = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 	st->bound_rows = g_hash_table_new(g_direct_hash, g_direct_equal);
 	st->ghosts = g_list_store_new(G_TYPE_FILE_INFO);
 	st->peeks = g_list_store_new(G_TYPE_FILE_INFO);
@@ -2885,8 +3115,12 @@ activate(GtkApplication *app, gpointer user_data)
 	st->sort_label = gtk_label_new(NULL);
 	gtk_widget_add_css_class(st->sort_label, "fhi-sort");
 	gtk_widget_set_visible(st->sort_label, FALSE);
+	st->llm_label = gtk_label_new(NULL);   /* "Claude Code" while an assistant runs */
+	gtk_widget_add_css_class(st->llm_label, "fhi-sort");
+	gtk_widget_set_visible(st->llm_label, FALSE);
 	GtkWidget *bottom = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
 	gtk_box_append(GTK_BOX(bottom), st->info_label);
+	gtk_box_append(GTK_BOX(bottom), st->llm_label);
 	gtk_box_append(GTK_BOX(bottom), st->sort_label);
 
 	GtkWidget *left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);

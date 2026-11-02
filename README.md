@@ -29,6 +29,15 @@ press Enter.
 - **Folder peeking** – `→` opens the highlighted folder inside the list (indented, nesting works,
   no `cd`); `←` closes it, or jumps from an entry back to its folder. `Enter` still `cd`s, and keeps
   whatever you were typing on the command line.
+- **AI coding assistants** – FHI recognises Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, Cursor
+  Agent, Amp, Droid and the open source ones: opencode, Qwen Code, Kimi CLI, Kilo Code, Mistral Vibe,
+  Continue, Crush, aider, goose, Cline, OpenHands, Plandex, Open Interpreter, gptme, RA.Aid, plus
+  plain chat clients (Ollama, `llm`, aichat, sgpt). A small label under the list shows which one is
+  running. `Shift+Enter` on a file pastes it the way that tool wants: `@src/main.c` for tools with
+  @-mentions (relative to the folder the assistant runs in, quoted if the name has spaces), the plain
+  path for the others. While it works, files it creates (green) or edits (yellow) light up in the
+  list, folders above them too, and an opened (`→`) folder shows new files inside it. The glow fades
+  after 12 seconds. `.git`, `node_modules`, `build`, `target` and similar folders are not watched.
 - **SSH session panel** – while `ssh` is running, the file list (which is about *this* machine) dims
   and a card shows the connection: host, port, how long you have been connected, jump host and
   forwarding, and what the server says about your account: user and uid, groups, home directory
