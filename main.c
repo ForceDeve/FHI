@@ -15,6 +15,8 @@
 #include "gitinfo.h"
 #include "sshinfo.h"
 #include "llmcli.h"
+#include "tmuxinfo.h"
+#include <signal.h>
 #include "theme.h"
 #include <strings.h>
 
@@ -51,7 +53,15 @@ typedef struct {
 	GtkWidget *list_view;            /* the file list (left panel) */
 	GtkDirectoryList *dir_list;      /* the folder the list is showing */
 	GtkSingleSelection *selection;   /* which row is highlighted */
-	GPid shell_pid;                  /* process id of zsh, 0 until it started */
+	GPid shell_pid;                  /* process id of zsh in the current tab, 0 until it started */
+	GtkWidget *notebook;             /* the tabs; every page is a VteTerminal, st->terminal is the shown one */
+
+	/* --- tmux in the terminal: the file list follows the pane that has focus --- */
+	pid_t tmux_client;               /* the tmux client these belong to, 0 = tmux is not in front */
+	pid_t tmux_pane_pid;             /* first process of the active pane (its shell) */
+	char *tmux_tty;                  /* the pane's terminal, NULL until the first answer */
+	char *tmux_path;                 /* the pane's folder */
+	gboolean tmux_fhi;               /* the pane's shell has FHI's zsh hooks */
 
 	/* --- command preview (highlighting files the typed command affects) --- */
 	GListStore *ghosts;              /* fake rows for files that do not exist yet */
@@ -117,6 +127,8 @@ typedef struct {
 	GtkWidget *reverse_switch;
 } State;
 
+static void tab_close_later(State *st, GtkWidget *terminal);
+
 static void
 child_ready(VteTerminal *terminal, GPid pid, GError *error, gpointer user_data)
 {
@@ -125,14 +137,20 @@ child_ready(VteTerminal *terminal, GPid pid, GError *error, gpointer user_data)
 		g_printerr("failed to spawn shell: %s\n", error->message);
 		g_clear_error(&error);
 	}
-	if (pid == -1) gtk_window_destroy(GTK_WINDOW(st->window));
-	else st->shell_pid = pid; /* remember zsh's PID, see shell_is_foreground() */
+	if (pid == -1) {
+		tab_close_later(st, GTK_WIDGET(terminal));
+		return;
+	}
+	/* remember zsh's PID (see shell_is_foreground()); every tab has its own */
+	g_object_set_data(G_OBJECT(terminal), "fhi-shell-pid", GINT_TO_POINTER(pid));
+	if (GTK_WIDGET(terminal) == st->terminal) st->shell_pid = pid;
 }
 
+/* The shell of a tab ended (`exit`, Ctrl+D): close that tab, or the window if it was the last */
 static void
 child_exited(VteTerminal *terminal, int status, gpointer user_data)
 {
-	gtk_window_destroy(GTK_WINDOW(user_data));
+	tab_close_later(user_data, GTK_WIDGET(terminal));
 }
 
 
@@ -613,6 +631,7 @@ static void
 on_title_changed(VteTerminal *terminal, gpointer user_data)
 {
 	State *st = user_data;
+	if (GTK_WIDGET(terminal) != st->terminal) return;   /* a tab in the background */
 	const char *title = vte_terminal_get_window_title(terminal);
 	if (title == NULL) return;
 
@@ -665,21 +684,28 @@ on_dir_items_changed(GListModel *model, guint position, guint removed, guint add
 	if (st->preview_idle == 0) st->preview_idle = g_idle_add(preview_idle_cb, st);
 }
 
+static gboolean tmux_mode(State *st);
+
+/* Tab title: the folder's name ("~" for the home folder) */
 static void
-on_cwd_changed(VteTerminal *terminal, gpointer user_data)
+tab_set_title(State *st, GtkWidget *terminal, const char *path)
 {
-	State *st = user_data;
+	if (st->notebook == NULL) return;
+	char *base = NULL;
+	if (path == NULL) base = g_strdup("shell");
+	else if (strcmp(path, g_get_home_dir()) == 0) base = g_strdup("~");
+	else if (strcmp(path, "/") == 0) base = g_strdup("/");
+	else base = g_path_get_basename(path);
+	gtk_notebook_set_tab_label_text(GTK_NOTEBOOK(st->notebook), terminal, base);
+	g_free(base);
+}
+
+/* Make the file list show folder `file` (does nothing if it already does) */
+static void
+sidebar_set_dir(State *st, GFile *file)
+{
 	GtkDirectoryList *list = st->dir_list;
-
-	/* VTE owns this string, so we must not free it. NULL means "unknown". */
-	const char *uri = vte_terminal_get_current_directory_uri(terminal);
-	if (uri == NULL) return;
-
-	/* g_file_new_for_uri() decodes "file://" and the %20-style escapes for us */
-	GFile *file = g_file_new_for_uri(uri);
-
-	/* The signal fires before every prompt, even if we did not change folder.
-	 * Only reload the list when the directory really is a different one. */
+	/* Only reload the list when the directory really is a different one. */
 	GFile *current = gtk_directory_list_get_file(list); /* not ours: do not unref */
 	if (current == NULL || !g_file_equal(current, file)) {
 		/* The focused row is thrown away with the old list, and GTK would then
@@ -689,9 +715,28 @@ on_cwd_changed(VteTerminal *terminal, gpointer user_data)
 		gtk_directory_list_set_file(list, file);
 		if (had_focus) gtk_widget_grab_focus(st->list_view);
 	}
+}
 
-	/* We created "file", so we release it. The list took its own reference.
-	 * (We never unref "list": we did not create it, the sort model owns it.) */
+static void
+on_cwd_changed(VteTerminal *terminal, gpointer user_data)
+{
+	State *st = user_data;
+
+	/* VTE owns this string, so we must not free it. NULL means "unknown". */
+	const char *uri = vte_terminal_get_current_directory_uri(terminal);
+	if (uri == NULL) return;
+
+	/* g_file_new_for_uri() decodes "file://" and the %20-style escapes for us */
+	GFile *file = g_file_new_for_uri(uri);
+	char *path = g_file_get_path(file);
+	tab_set_title(st, GTK_WIDGET(terminal), path);
+	g_free(path);
+
+	/* The signal fires before every prompt, even if we did not change folder. Only the tab
+	 * in front drives the file list; inside tmux the focused pane does (see on_tmux_pane). */
+	if (GTK_WIDGET(terminal) == st->terminal && !tmux_mode(st)) sidebar_set_dir(st, file);
+
+	/* We created "file", so we release it. The list took its own reference. */
 	g_object_unref(file);
 }
 
@@ -711,12 +756,38 @@ on_cwd_changed(VteTerminal *terminal, gpointer user_data)
 /* Name of the program in front of the terminal (new string, free it), NULL if unknown */
 /* Process id of the program in front of the terminal (0 if unknown) */
 static pid_t
-foreground_pid(State *st)
+vte_fg_pid(State *st)   /* what the terminal itself has in front: tmux, not the program inside tmux */
 {
 	VtePty *pty = vte_terminal_get_pty(VTE_TERMINAL(st->terminal));
 	if (pty == NULL || st->shell_pid <= 0) return 0;
 	pid_t pgid = tcgetpgrp(vte_pty_get_fd(pty));
 	return pgid > 0 ? pgid : 0;
+}
+
+/* tmux is in front and we know which pane has focus */
+static gboolean
+tmux_mode(State *st)
+{
+	return st->tmux_tty != NULL && st->tmux_client > 0 && st->tmux_client == vte_fg_pid(st);
+}
+
+/* The program that receives the keyboard: inside tmux, the one in the focused pane */
+static pid_t
+foreground_pid(State *st)
+{
+	pid_t pid = vte_fg_pid(st);
+	if (pid > 0 && st->tmux_tty != NULL && pid == st->tmux_client) {
+		pid_t inner = fhi_tmux_tty_foreground(st->tmux_tty);
+		if (inner > 0) return inner;
+	}
+	return pid;
+}
+
+/* The shell to compare the foreground with: the tab's, or the focused tmux pane's */
+static pid_t
+effective_shell_pid(State *st)
+{
+	return tmux_mode(st) ? st->tmux_pane_pid : st->shell_pid;
 }
 
 static char *
@@ -746,9 +817,10 @@ is_unsupported_shell(const char *comm)
 static gboolean
 shell_is_foreground(State *st)
 {
-	VtePty *pty = vte_terminal_get_pty(VTE_TERMINAL(st->terminal));
-	if (pty == NULL || st->shell_pid <= 0) return FALSE;
-	if (tcgetpgrp(vte_pty_get_fd(pty)) != st->shell_pid) return FALSE;
+	pid_t shell = effective_shell_pid(st);
+	if (shell <= 0 || foreground_pid(st) != shell) return FALSE;
+	/* a tmux pane whose shell was not started by FHI would type our "push-line" key into the void */
+	if (tmux_mode(st) && !st->tmux_fhi) return FALSE;
 	return st->unsupported_shell == NULL;   /* `exec bash` keeps the pid, so look at the name too */
 }
 
@@ -1160,11 +1232,9 @@ on_row_activated(GtkListView *view, guint position, gpointer user_data)
 static Foreground
 foreground_kind(State *st)
 {
-	VtePty *pty = vte_terminal_get_pty(VTE_TERMINAL(st->terminal));
-	if (pty == NULL || st->shell_pid <= 0) return FG_OTHER;
-	pid_t pgid = tcgetpgrp(vte_pty_get_fd(pty));
-	if (pgid == st->shell_pid) return st->unsupported_shell ? FG_OTHER : FG_SHELL;
+	pid_t pgid = foreground_pid(st);
 	if (pgid <= 0) return FG_OTHER;
+	if (pgid == effective_shell_pid(st)) return st->unsupported_shell ? FG_OTHER : FG_SHELL;
 
 	char *comm = foreground_comm(st);
 	if (comm == NULL) return FG_OTHER;
@@ -1267,6 +1337,70 @@ paste_selected_path(State *st)
 	gtk_widget_grab_focus(st->terminal);
 }
 
+
+/* What the typed command previewed belongs to another tab / pane: forget it */
+static void
+preview_reset(State *st)
+{
+	g_free(st->last_buffer);
+	st->last_buffer = NULL;
+	if (st->preview_idle == 0) st->preview_idle = g_idle_add(preview_idle_cb, st);
+}
+
+/* tmux is no longer in front (detached, closed, another tab) */
+static void
+tmux_forget(State *st, gboolean back_to_shell_dir)
+{
+	if (st->tmux_client == 0 && st->tmux_tty == NULL) return;
+	st->tmux_client = 0;
+	st->tmux_pane_pid = 0;
+	st->tmux_fhi = FALSE;
+	g_clear_pointer(&st->tmux_tty, g_free);
+	g_clear_pointer(&st->tmux_path, g_free);
+	/* the terminal's own idea of the folder (from the shell's last prompt) is right again */
+	const char *uri = back_to_shell_dir ? vte_terminal_get_current_directory_uri(VTE_TERMINAL(st->terminal)) : NULL;
+	if (uri) {
+		GFile *file = g_file_new_for_uri(uri);
+		sidebar_set_dir(st, file);
+		g_object_unref(file);
+	}
+}
+
+/*
+ * The answer of the tmux server: which pane has focus, its folder, and its terminal (so the
+ * program in it can be looked up). Moving between panes (prefix + arrow...) lands here
+ * within half a second and the file list follows.
+ */
+static void
+on_tmux_pane(pid_t client, const FhiTmuxPane *pane, gpointer user_data)
+{
+	State *st = user_data;
+	if (client != vte_fg_pid(st)) return;   /* tmux was left or the tab changed meanwhile */
+	if (pane == NULL) {                     /* cannot ask (no tmux program?): act like plain tmux client */
+		tmux_forget(st, FALSE);
+		return;
+	}
+
+	gboolean new_pane = pane->pane_pid != st->tmux_pane_pid || g_strcmp0(pane->tty, st->tmux_tty) != 0;
+	gboolean new_path = new_pane || g_strcmp0(pane->path, st->tmux_path) != 0;
+	st->tmux_client = client;
+	st->tmux_pane_pid = pane->pane_pid;
+	if (new_pane) {
+		g_free(st->tmux_tty);
+		st->tmux_tty = g_strdup(pane->tty);
+		st->tmux_fhi = fhi_tmux_pane_is_fhi(pane->pane_pid);
+		g_hash_table_remove_all(st->llm_act);   /* the lit files were another pane's */
+		preview_reset(st);
+	}
+	if (new_path) {
+		g_free(st->tmux_path);
+		st->tmux_path = g_strdup(pane->path);
+		GFile *file = g_file_new_for_path(pane->path);
+		sidebar_set_dir(st, file);
+		g_object_unref(file);
+		tab_set_title(st, st->terminal, pane->path);
+	}
+}
 
 /* Remember that `key` (relative to the list's folder) was touched by the assistant */
 static void
@@ -1384,6 +1518,16 @@ static gboolean
 check_shell_support(gpointer user_data)
 {
 	State *st = user_data;
+
+	/* tmux in front? Ask the server which pane has focus (answer arrives in on_tmux_pane) */
+	pid_t outer = vte_fg_pid(st);
+	if (outer > 0 && fhi_tmux_is_client(outer)) {
+		if (st->tmux_client != 0 && st->tmux_client != outer) tmux_forget(st, FALSE);   /* another tmux */
+		fhi_tmux_query(outer, on_tmux_pane, st);
+	} else {
+		tmux_forget(st, TRUE);
+	}
+
 	pid_t pid = foreground_pid(st);
 	char *comm = foreground_comm(st);
 	const char *bad = (comm && is_unsupported_shell(comm)) ? comm : NULL;
@@ -1411,7 +1555,7 @@ check_shell_support(gpointer user_data)
 		st->ssh = NULL;
 	}
 	fhi_ssh_card_update(st->ssh_card, st->ssh);
-	llm_update(st, pid, pid == st->shell_pid || st->ssh != NULL);
+	llm_update(st, pid, pid == effective_shell_pid(st) || st->ssh != NULL);
 
 	gboolean dim = bad != NULL || st->ssh != NULL;
 	gtk_widget_set_sensitive(st->left_panel, !dim);
@@ -1420,6 +1564,182 @@ check_shell_support(gpointer user_data)
 
 	g_free(comm);
 	return G_SOURCE_CONTINUE;
+}
+
+/* ======================================================================== */
+/* Tabs                                                                       */
+/*                                                                            */
+/* Every tab is a VteTerminal (a page of st->notebook) with its own shell. The  */
+/* file list, the preview and everything else follow the tab in front, which   */
+/* is st->terminal.                                                           */
+/* ======================================================================== */
+
+/* Start zsh in `terminal`, with FHI's startup files (see zsh/.zshrc) */
+static void
+spawn_shell(State *st, GtkWidget *terminal, const char *cwd)
+{
+	char *command[] = { "zsh", NULL };
+
+	/*
+	 * Make zsh load OUR startup files (see zsh/.zshrc), which in turn load the
+	 * user's own ones and add the hook that reports the working directory.
+	 *   - FHI_USER_ZDOTDIR: where the user's files live (their ZDOTDIR if they
+	 *     set one, otherwise their home directory)
+	 *   - FHI_ZDOTDIR / ZDOTDIR: our folder (the path is baked in by CMake)
+	 */
+	char **envp = g_get_environ();
+	const char *user_zdotdir = g_environ_getenv(envp, "FHI_USER_ZDOTDIR");   /* set already when FHI runs inside FHI */
+	char *own = NULL;
+	if (user_zdotdir == NULL) {
+		own = g_strdup(g_environ_getenv(envp, "ZDOTDIR"));
+		if (!own) own = g_strdup(g_get_home_dir());
+		user_zdotdir = own;
+	}
+	envp = g_environ_setenv(envp, "FHI_USER_ZDOTDIR", user_zdotdir, TRUE);
+	envp = g_environ_setenv(envp, "FHI_ZDOTDIR", FHI_ZSH_DIR, TRUE);
+	envp = g_environ_setenv(envp, "ZDOTDIR", FHI_ZSH_DIR, TRUE);
+	g_free(own);
+
+	vte_terminal_spawn_async(VTE_TERMINAL(terminal),
+	    VTE_PTY_DEFAULT,
+	    cwd,          /* working directory  */
+	    command,      /* command */
+	    envp,         /* environment */
+	    G_SPAWN_SEARCH_PATH, /* spawn flags: look up zsh in PATH */
+	    NULL, NULL, NULL, /* child setup, data, destroy */
+	    -1,           /* timeout */
+	    NULL,         /* cancellable */
+	    child_ready,  /* callback */
+	    st);          /* user_data */
+	g_strfreev(envp); /* VTE made its own copy */
+}
+
+static void apply_terminal_theme_one(State *st, VteTerminal *term);
+static void apply_terminal_font(State *st, VteTerminal *term);
+
+/* The tab bar only shows when there is more than one tab */
+static void
+tabs_update_bar(State *st)
+{
+	gtk_notebook_set_show_tabs(GTK_NOTEBOOK(st->notebook), gtk_notebook_get_n_pages(GTK_NOTEBOOK(st->notebook)) > 1);
+}
+
+/* A new tab, starting in `cwd` (NULL = home). `select`: bring it to the front. */
+static void
+tab_new(State *st, const char *cwd, gboolean select)
+{
+	GtkNotebook *nb = GTK_NOTEBOOK(st->notebook);
+	GtkWidget *terminal = vte_terminal_new();
+	gtk_widget_set_hexpand(terminal, TRUE);
+	gtk_widget_set_vexpand(terminal, TRUE);
+	g_signal_connect(terminal, "child-exited", G_CALLBACK(child_exited), st);
+	g_signal_connect(terminal, "current-directory-uri-changed", G_CALLBACK(on_cwd_changed), st);
+	/* The command being typed arrives through the terminal title (see zsh/.zshrc) */
+	g_signal_connect(terminal, "window-title-changed", G_CALLBACK(on_title_changed), st);
+
+	if (cwd == NULL) cwd = g_get_home_dir();
+	GtkWidget *label = gtk_label_new(NULL);
+	gtk_label_set_max_width_chars(GTK_LABEL(label), 18);
+	gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_MIDDLE);
+	if (st->terminal == NULL) st->terminal = terminal;   /* the very first tab */
+	int num = gtk_notebook_append_page(nb, terminal, label);
+	gtk_notebook_set_tab_reorderable(nb, terminal, TRUE);
+	tab_set_title(st, terminal, cwd);
+	tabs_update_bar(st);
+
+	apply_terminal_theme_one(st, VTE_TERMINAL(terminal));
+	apply_terminal_font(st, VTE_TERMINAL(terminal));
+	spawn_shell(st, terminal, cwd);
+	if (select) {
+		gtk_notebook_set_current_page(nb, num);
+		gtk_widget_grab_focus(terminal);
+	}
+}
+
+/* The tab in front changed (clicked, Ctrl+PageUp/Down, one was closed): everything follows it */
+static void
+on_tab_switched(GtkNotebook *nb, GtkWidget *page, guint num, gpointer user_data)
+{
+	State *st = user_data;
+	if (st->dir_list == NULL || page == st->terminal) return;
+
+	gboolean list_focused = list_has_focus(st);
+	st->terminal = page;
+	st->shell_pid = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(page), "fhi-shell-pid"));
+	tmux_forget(st, FALSE);   /* the new tab may be in tmux too: the next check finds out */
+	g_hash_table_remove_all(st->llm_act);
+
+	const char *uri = vte_terminal_get_current_directory_uri(VTE_TERMINAL(page));
+	if (uri) {
+		GFile *file = g_file_new_for_uri(uri);
+		sidebar_set_dir(st, file);
+		g_object_unref(file);
+	}
+	preview_reset(st);
+	check_shell_support(st);   /* ssh / llm / unsupported-shell state of this tab, right away */
+	refresh_all_rows(st);
+	if (!list_focused) gtk_widget_grab_focus(page);
+}
+
+/* Switch tabs, wrapping around: step is +1 or -1 */
+static void
+tab_step(State *st, int step)
+{
+	GtkNotebook *nb = GTK_NOTEBOOK(st->notebook);
+	int n = gtk_notebook_get_n_pages(nb);
+	if (n < 2) return;
+	gtk_notebook_set_current_page(nb, (gtk_notebook_get_current_page(nb) + step + n) % n);
+}
+
+typedef struct { State *st; GtkWidget *terminal; } CloseJob;
+
+static gboolean
+tab_close_cb(gpointer data)
+{
+	CloseJob *job = data;
+	State *st = job->st;
+	GtkNotebook *nb = GTK_NOTEBOOK(st->notebook);
+	int num = gtk_notebook_page_num(nb, job->terminal);
+	if (num >= 0) {
+		if (gtk_notebook_get_n_pages(nb) <= 1) {
+			gtk_window_destroy(GTK_WINDOW(st->window));   /* the last tab: leave */
+		} else {
+			/* move to a neighbour first, so st->terminal never points at a dead widget */
+			if (job->terminal == st->terminal) gtk_notebook_set_current_page(nb, num > 0 ? num - 1 : 1);
+			gtk_notebook_remove_page(nb, gtk_notebook_page_num(nb, job->terminal));
+			tabs_update_bar(st);
+		}
+	}
+	g_object_unref(job->terminal);
+	g_free(job);
+	return G_SOURCE_REMOVE;
+}
+
+/* Closing from inside the terminal's own signal is asking for trouble: do it a moment later */
+static void
+tab_close_later(State *st, GtkWidget *terminal)
+{
+	CloseJob *job = g_new(CloseJob, 1);
+	job->st = st;
+	job->terminal = g_object_ref(terminal);
+	g_idle_add(tab_close_cb, job);
+}
+
+/* Ctrl+Shift+W: end the shell of the tab in front (the tab closes by itself when it is gone) */
+static void
+tab_close_current(State *st)
+{
+	if (gtk_notebook_get_n_pages(GTK_NOTEBOOK(st->notebook)) < 2 || st->shell_pid <= 0) return;
+	kill(st->shell_pid, SIGHUP);
+}
+
+static void
+on_new_tab_clicked(GtkButton *button, gpointer user_data)
+{
+	State *st = user_data;
+	char *dir = list_dir_path(st);
+	tab_new(st, dir, TRUE);
+	g_free(dir);
 }
 
 static void menu_set_open(State *st, gboolean open);
@@ -1507,6 +1827,21 @@ on_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode,
 			filter_begin(st, utf8);
 			return TRUE;
 		}
+	}
+	/* Tabs: Ctrl+Shift+T new, Ctrl+Shift+W close, Ctrl+PageUp/PageDown or Ctrl+(Shift+)Tab switch */
+	if (modifiers == (GDK_CONTROL_MASK | GDK_SHIFT_MASK) && (keyval == GDK_KEY_t || keyval == GDK_KEY_T)) {
+		on_new_tab_clicked(NULL, st);
+		return TRUE;
+	}
+	if (modifiers == (GDK_CONTROL_MASK | GDK_SHIFT_MASK) && (keyval == GDK_KEY_w || keyval == GDK_KEY_W)) {
+		tab_close_current(st);
+		return TRUE;
+	}
+	if ((modifiers == GDK_CONTROL_MASK && (keyval == GDK_KEY_Page_Down || keyval == GDK_KEY_Tab)) ||
+	    (modifiers == GDK_CONTROL_MASK && keyval == GDK_KEY_Page_Up) ||
+	    (modifiers == (GDK_CONTROL_MASK | GDK_SHIFT_MASK) && keyval == GDK_KEY_ISO_Left_Tab)) {
+		tab_step(st, (keyval == GDK_KEY_Page_Up || keyval == GDK_KEY_ISO_Left_Tab) ? -1 : +1);
+		return TRUE;
 	}
 	/* Ctrl+Shift+C / V: copy and paste (plain Ctrl+C must stay SIGINT for the terminal) */
 	if (modifiers == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)) {
@@ -1850,9 +2185,8 @@ display_composited(void)
  * the alpha lives in it.
  */
 static void
-apply_terminal_theme(State *st)
+apply_terminal_theme_one(State *st, VteTerminal *term)
 {
-	VteTerminal *term = VTE_TERMINAL(st->terminal);
 	const FhiTheme *t = &st->cfg.theme;
 
 	vte_terminal_set_default_colors(term);   /* also resets palette, cursor */
@@ -1875,6 +2209,30 @@ apply_terminal_theme(State *st)
 	/* Set on its own as well: this is the call that carries the alpha for sure */
 	if (bgp) vte_terminal_set_color_background(term, bgp);
 	if (t->set[TC_CURSOR]) vte_terminal_set_color_cursor(term, &t->col[TC_CURSOR]);
+}
+
+static void
+apply_terminal_theme(State *st)
+{
+	if (st->notebook == NULL) return;
+	GtkNotebook *nb = GTK_NOTEBOOK(st->notebook);
+	for (int i = 0; i < gtk_notebook_get_n_pages(nb); i++)
+		apply_terminal_theme_one(st, VTE_TERMINAL(gtk_notebook_get_nth_page(nb, i)));
+}
+
+/* terminal font: the user's own choice if there is one, else plain Monospace.
+ * Either way the bundled Nerd Font is the last family, so icons in prompts
+ * (starship, powerlevel10k, eza, ...) show even without a patched font. */
+static void
+apply_terminal_font(State *st, VteTerminal *term)
+{
+	const Settings *c = &st->cfg;
+	PangoFontDescription *fd = pango_font_description_from_string(c->term_font ? c->term_font : "Monospace 10");
+	char *families = g_strdup_printf("%s, " FHI_ICON_FONT, pango_font_description_get_family(fd));
+	pango_font_description_set_family(fd, families);
+	vte_terminal_set_font(term, fd);
+	pango_font_description_free(fd);
+	g_free(families);
 }
 
 /* Light / dark, the style sheet (FHI's own rules, then the theme's) and the terminal colors */
@@ -1956,18 +2314,10 @@ static void
 apply_all(State *st, gboolean save)
 {
 	Settings *c = &st->cfg;
-	VteTerminal *term = VTE_TERMINAL(st->terminal);
 	apply_theme(st);
-
-	/* terminal font: the user's own choice if there is one, else plain Monospace.
-	 * Either way the bundled Nerd Font is the last family, so icons in prompts
-	 * (starship, powerlevel10k, eza, ...) show even without a patched font. */
-	PangoFontDescription *fd = pango_font_description_from_string(c->term_font ? c->term_font : "Monospace 10");
-	char *families = g_strdup_printf("%s, " FHI_ICON_FONT, pango_font_description_get_family(fd));
-	pango_font_description_set_family(fd, families);
-	vte_terminal_set_font(term, fd);
-	pango_font_description_free(fd);
-	g_free(families);
+	GtkNotebook *nb = GTK_NOTEBOOK(st->notebook);
+	for (int i = 0; i < gtk_notebook_get_n_pages(nb); i++)
+		apply_terminal_font(st, VTE_TERMINAL(gtk_notebook_get_nth_page(nb, i)));
 
 	gtk_filter_changed(st->hidden_filter, GTK_FILTER_CHANGE_DIFFERENT);
 	if (st->sorter) gtk_sorter_changed(st->sorter, GTK_SORTER_CHANGE_DIFFERENT);
@@ -2956,13 +3306,12 @@ static void
 activate(GtkApplication *app, gpointer user_data)
 {
 	GtkWidget *window = gtk_application_window_new(app);
-	GtkWidget *terminal = vte_terminal_new();
 
 	/* One State shared by all callbacks. (Never freed: it lives as long as the
 	 * program, and the OS cleans up when we exit.) */
 	State *st = g_new0(State, 1);
 	st->window = window;
-	st->terminal = terminal;
+	st->notebook = gtk_notebook_new();   /* the tabs; see tab_new() */
 	st->roles = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
 	st->llm_act = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 	st->bound_rows = g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -3003,39 +3352,6 @@ activate(GtkApplication *app, gpointer user_data)
 	gtk_icon_theme_add_search_path(gtk_icon_theme_get_for_display(gdk_display_get_default()), FHI_ICON_DIR);
 	gtk_window_set_icon_name(GTK_WINDOW(window), "fhi");
 
-	/* Start a new shell */
-	char *command[] = { "zsh", NULL };
-
-	/*
-	 * Make zsh load OUR startup files (see zsh/.zshrc), which in turn load the
-	 * user's own ones and add the hook that reports the working directory.
-	 *   - FHI_USER_ZDOTDIR: where the user's files live (their ZDOTDIR if they
-	 *     set one, otherwise their home directory)
-	 *   - FHI_ZDOTDIR / ZDOTDIR: our folder (the path is baked in by CMake)
-	 */
-	char **envp = g_get_environ();
-	char *user_zdotdir = g_strdup(g_environ_getenv(envp, "ZDOTDIR"));
-	if (!user_zdotdir) user_zdotdir = g_strdup(g_get_home_dir());
-	envp = g_environ_setenv(envp, "FHI_USER_ZDOTDIR", user_zdotdir, TRUE);
-	envp = g_environ_setenv(envp, "FHI_ZDOTDIR", FHI_ZSH_DIR, TRUE);
-	envp = g_environ_setenv(envp, "ZDOTDIR", FHI_ZSH_DIR, TRUE);
-	g_free(user_zdotdir);
-
-	vte_terminal_spawn_async(VTE_TERMINAL(terminal),
-	    VTE_PTY_DEFAULT,
-	    g_get_home_dir(), /* working directory  */
-	    command,      /* command */
-	    envp,         /* environment */
-	    G_SPAWN_SEARCH_PATH, /* spawn flags: look up zsh in PATH */
-	    NULL, NULL, NULL, /* child setup, data, destroy */
-	    -1,           /* timeout */
-	    NULL,         /* cancellable */
-	    child_ready,  /* callback */
-	    st);          /* user_data */
-	g_strfreev(envp); /* VTE made its own copy */
-
-	g_signal_connect(terminal, "child-exited", G_CALLBACK(child_exited), window);
-
 	/* File list of the home directory */
 	GFile *home = g_file_new_for_path(g_get_home_dir());
 	GtkDirectoryList *dir_list = gtk_directory_list_new(FHI_ATTRS, home);
@@ -3044,11 +3360,6 @@ activate(GtkApplication *app, gpointer user_data)
 	g_object_unref(home);
 	st->dir_list = dir_list;
 
-	/* Update the list whenever the shell reports a new directory */
-	g_signal_connect(terminal, "current-directory-uri-changed", G_CALLBACK(on_cwd_changed), st);
-
-	/* The command being typed arrives through the terminal title (see zsh/.zshrc) */
-	g_signal_connect(terminal, "window-title-changed", G_CALLBACK(on_title_changed), st);
 	g_signal_connect(dir_list, "items-changed", G_CALLBACK(on_dir_items_changed), st);
 
 	GtkSorter *sorter = GTK_SORTER(gtk_custom_sorter_new(compare_info, st, NULL));
@@ -3158,7 +3469,18 @@ activate(GtkApplication *app, gpointer user_data)
 	gtk_widget_add_css_class(frame1, "fhi-square");   /* no rounded corners on the two panels */
 	gtk_widget_add_css_class(frame2, "fhi-square");
 	gtk_frame_set_child(GTK_FRAME(frame1), left_overlay);
-	gtk_frame_set_child(GTK_FRAME(frame2), terminal);
+	/* Tabs: the first one now (it starts the shell), then the "+" button and the switch signal */
+	GtkNotebook *nb = GTK_NOTEBOOK(st->notebook);
+	gtk_notebook_set_scrollable(nb, TRUE);
+	gtk_notebook_set_show_border(nb, FALSE);
+	tab_new(st, NULL, FALSE);
+	GtkWidget *plus = gtk_button_new_from_icon_name("list-add-symbolic");
+	gtk_button_set_has_frame(GTK_BUTTON(plus), FALSE);
+	gtk_widget_set_tooltip_text(plus, "New tab (Ctrl+Shift+T)");
+	g_signal_connect(plus, "clicked", G_CALLBACK(on_new_tab_clicked), st);
+	gtk_notebook_set_action_widget(nb, plus, GTK_PACK_END);
+	g_signal_connect(nb, "switch-page", G_CALLBACK(on_tab_switched), st);
+	gtk_frame_set_child(GTK_FRAME(frame2), st->notebook);
 	apply_all(st, FALSE);
 	gtk_window_present(GTK_WINDOW(window));
 	gtk_window_set_default_size (GTK_WINDOW(window), 800, 600);
