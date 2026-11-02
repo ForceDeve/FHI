@@ -4,7 +4,7 @@
 the folder you're in and highlights the files the command you're typing would affect, before you
 press Enter.
 
-> **Beta (0.1.3):** usable, but little tested outside the author's machine.
+> **Beta (0.1.4):** usable, but little tested outside the author's machine.
 
 ## Features
 
@@ -14,11 +14,28 @@ press Enter.
   `git commit` lights up the files it would commit (staged ones, or all tracked changes with `-a`)
   and `git push` the files in the commits it would send. Needs `git`; a change inside a subfolder
   lights up that folder.
+- **Build and packaging previews** – commands that read a file without naming it light that file
+  up: `make` (Makefile), `cmake` (CMakeLists.txt), `makepkg` (PKGBUILD, plus the package file it
+  will produce and the `src/` and `pkg/` folders it creates), `dpkg-buildpackage` (`debian/`),
+  `docker build` / `docker compose`, `cargo`, `go`, `npm`, `mvn`, `gradle` and more, and the
+  `./script` you are about to run. `cargo clean` shows `target/` as deleted. Building another
+  folder (`make -C x`, `cmake ..`) lights nothing up.
 - **Keyboard-driven list** – `Shift+←/→` switch between list and terminal, `Enter` opens a file or
   `cd`s into a folder, `Shift+Enter` pastes the path into whatever runs in the terminal (shell-quoted at the prompt, plain text in vim/nano, a quoted string in python), `Backspace` is `cd ..`.
+  `Ctrl+Shift+C` / `Ctrl+Shift+V` copy and paste in the terminal.
+- **Editor integration** – with vim or nano open, `Enter` on a text or source file saves what you
+  were editing and continues in the new file (vim: `:update | edit`; nano: a new buffer). If the
+  save fails, for example a read-only file, vim stays where it is and nothing is lost.
 - **Folder peeking** – `→` opens the highlighted folder inside the list (indented, nesting works,
   no `cd`); `←` closes it, or jumps from an entry back to its folder. `Enter` still `cd`s, and keeps
   whatever you were typing on the command line.
+- **SSH session panel** – while `ssh` is running, the file list (which is about *this* machine) dims
+  and a card shows the connection: host, port, how long you have been connected, jump host and
+  forwarding, and what the server says about your account: user and uid, groups, home directory
+  permissions, umask, shell, OS, kernel and uptime. It fits narrow panels and scrolls. The account
+  details come from one extra silent `ssh` with the same options and `BatchMode` (keys, agent or
+  ControlMaster; it never asks for a password and shows "unavailable" if it cannot log in). Set
+  `FHI_SSH_NO_QUERY=1` to never make that connection.
 - **Drag and drop** – drag a file or folder out of the list into a browser, Discord, a file manager
   or any app that accepts files (upload to a git release, share in chat...). It copies, never moves.
 - **File-type icons** – a colored Nerd Font icon per file: languages (C, C++, Python, JS/TS, Rust,
@@ -33,8 +50,8 @@ press Enter.
 - **Sorting** – name, size, modified, created or type; `Shift+↑/↓` changes the mode, `Ctrl+R` reverses.
 - **File info bar** – type detected from the file header (not the extension), size, created and
   last-accessed dates.
-- **Hamburger menu** (button, or `Tab` in the list) – theme and colors, cheat sheet, hidden files,
-  sorting and info settings.
+- **Hamburger menu** (button, or `Tab` in the list) – themes and colors, cheat sheet, hidden files,
+  sorting and info settings. See [Theming](#theming).
 
 ## Theming
 

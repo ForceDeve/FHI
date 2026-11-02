@@ -1090,6 +1090,22 @@ python_literal(const char *path)
 	return g_string_free(out, FALSE);
 }
 
+/* Ctrl+Shift+C: copy the terminal selection (nothing selected: nothing happens) */
+static void
+copy_from_terminal(State *st)
+{
+	VteTerminal *terminal = VTE_TERMINAL(st->terminal);
+	if (vte_terminal_get_has_selection(terminal))
+		vte_terminal_copy_clipboard_format(terminal, VTE_FORMAT_TEXT);
+}
+
+/* Ctrl+Shift+V */
+static void
+paste_from_clipboard(State *st)
+{
+	vte_terminal_paste_clipboard(VTE_TERMINAL(st->terminal));
+}
+
 /*
  * Shift+Enter: put the highlighted file's path where the program in the terminal wants it.
  *   shell   -> quoted for the shell, with a space after it, typed as keys
@@ -1098,17 +1114,6 @@ python_literal(const char *path)
  *   python  -> a quoted string literal 'path', pasted
  * Any other program in front: do nothing, we would only type garbage into it.
  */
-static void
-copy_from_terminal(State *st) {
-	VteTerminal *terminal = VTE_TERMINAL(st->terminal);
-	if (vte_terminal_get_has_selection(terminal))
-		vte_terminal_copy_clipboard_format(terminal, VTE_FORMAT_TEXT);
-}
-static void
-paste_from_clipboard(State *st) {
-
-	vte_terminal_paste_clipboard(VTE_TERMINAL(st->terminal));
-}
 static void
 paste_selected_path(State *st)
 {
@@ -1276,7 +1281,8 @@ on_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode,
 			return TRUE;
 		}
 	}
-	if ((modifiers & GDK_CONTROL_MASK) && (modifiers & GDK_SHIFT_MASK) ) {
+	/* Ctrl+Shift+C / V: copy and paste (plain Ctrl+C must stay SIGINT for the terminal) */
+	if (modifiers == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)) {
 		switch (keyval) {
 		case GDK_KEY_v:
 		case GDK_KEY_V:
@@ -1287,8 +1293,6 @@ on_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode,
 			copy_from_terminal(st);
 			return TRUE;
 		}
-
-
 	}
 	/* The rest are Shift+key shortcuts */
 	if (modifiers != GDK_SHIFT_MASK) return FALSE;
@@ -2389,6 +2393,7 @@ build_cheat_page(State *st, GtkWidget *stack)
 		{ "→ / ←", "Open / close the highlighted folder in place (file list)" },
 		{ "Backspace", "Go up one folder (cd ..) (file list)" },
 		{ "Shift + Enter", "Paste the file's path into the terminal: quoted for the shell, plain in vim / nano, a string in python (file list)" },
+		{ "Ctrl + Shift + C / V", "Copy the terminal selection / paste into the terminal" },
 		{ "Double click", "Same as Enter" },
 		{ "Drag a file", "Drop it into a browser, Discord, a file manager... (copies it)" },
 		{ "Shift + ↑ / ↓", "Next / previous sort mode (file list)" },

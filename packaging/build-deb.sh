@@ -32,8 +32,10 @@ Maintainer: $MAINTAINER
 Description: Terminal with a file list that previews what your command will do
  FHI is a GTK4 terminal that always runs zsh. Next to the terminal it shows
  the current folder and highlights the files the command you are typing
- would touch, create or delete. Shows file-type icons, can peek into folders
- and previews what git commit and git push will include (needs git).
+ would touch, create or delete, including what build and packaging tools
+ (make, cmake, makepkg, cargo, ...) would use. Shows file-type icons, can peek
+ into folders, previews what git commit and git push will include (needs git),
+ shows a session card for ssh, and can be themed with simple theme files.
 CONTROL
 
 # the .deb must not be owned by the build user
