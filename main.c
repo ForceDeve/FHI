@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <glib/gstdio.h>
 #include "preview.h"
+#include "filetype.h"
 #include <strings.h>
 
 /* Indexes into Settings.col */
@@ -47,6 +48,7 @@ typedef struct {
 	int sort_mode;              /* SORT_* */
 	gboolean sort_reverse;
 	gboolean folders_first;
+	char *term_font;            /* terminal font from settings.ini ("term_font"), NULL = default */
 } Settings;
 
 /*
@@ -82,6 +84,7 @@ typedef struct {
 	GtkWidget *menu_stack;
 	GtkWidget *menu_first;           /* first button of the main page, gets focus on open */
 	GtkWidget *last_pane;            /* list or terminal: where focus goes after the menu closes */
+	GtkWidget *font_btn;             /* terminal font chooser */
 	GtkWidget *scheme_dd;            /* theme page widgets, kept so "Reset" can update them */
 	GtkWidget *color_btn[C_COUNT];
 	GtkWidget *term_switch;
@@ -146,8 +149,9 @@ static void
 setup_item(GtkSignalListItemFactory *factory, GtkListItem *item, gpointer user_data)
 {
 	GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-	GtkWidget *icon = gtk_image_new();
+	GtkWidget *icon = gtk_label_new(NULL);   /* a Nerd Font glyph, see filetype.c */
 	GtkWidget *label = gtk_label_new(NULL);
+	gtk_widget_add_css_class(icon, "fhi-icon");
 	gtk_label_set_xalign(GTK_LABEL(label), 0);
 	gtk_widget_add_css_class(box, "fhi-row");
 	gtk_box_append(GTK_BOX(box), icon);
@@ -165,7 +169,12 @@ bind_item(GtkSignalListItemFactory *factory, GtkListItem *item, gpointer user_da
 	GtkWidget *icon = gtk_widget_get_first_child(box);
 	GtkWidget *label = gtk_widget_get_last_child(box);
 
-	gtk_image_set_from_gicon(GTK_IMAGE(icon), g_file_info_get_icon(info));
+	const char *color;
+	const char *glyph = fhi_file_icon(g_file_info_get_name(info),
+	                                  g_file_info_get_file_type(info) == G_FILE_TYPE_DIRECTORY, &color);
+	char *markup = g_markup_printf_escaped("<span foreground=\"%s\">%s</span>", color, glyph);
+	gtk_label_set_markup(GTK_LABEL(icon), markup);
+	g_free(markup);
 	gtk_label_set_text(GTK_LABEL(label), g_file_info_get_display_name(info));
 
 	/* Remember which file this row shows, and keep track of the row, so that
@@ -715,6 +724,9 @@ load_settings(State *st)
 			if (v) gdk_rgba_parse(&c->col[i], v);
 			g_free(v);
 		}
+		g_free(c->term_font);
+		c->term_font = g_key_file_get_string(kf, "fhi", "term_font", NULL);
+		if (c->term_font && !*c->term_font) g_clear_pointer(&c->term_font, g_free);
 		kf_get_bool(kf, "custom_term", &c->custom_term);
 		kf_get_bool(kf, "show_hidden", &c->show_hidden);
 		kf_get_bool(kf, "info_type", &c->info_type);
@@ -743,6 +755,7 @@ save_settings(State *st)
 		g_key_file_set_string(kf, "fhi", color_key[i], v);
 		g_free(v);
 	}
+	if (c->term_font) g_key_file_set_string(kf, "fhi", "term_font", c->term_font);
 	g_key_file_set_boolean(kf, "fhi", "custom_term", c->custom_term);
 	g_key_file_set_boolean(kf, "fhi", "show_hidden", c->show_hidden);
 	g_key_file_set_boolean(kf, "fhi", "info_type", c->info_type);
@@ -971,6 +984,7 @@ apply_all(State *st, gboolean save)
 	    ".fhi-dest   { background: alpha(%s, 0.40); }"
 	    ".fhi-remove { background: alpha(%s, 0.40); }"
 	    ".fhi-ghost label { font-style: italic; }"
+	    ".fhi-icon   { font-family: '" FHI_ICON_FONT "'; min-width: 1.4em; }"
 	    ".fhi-info   { font-size: %dpt; padding: 4px 8px; opacity: 0.85; }"
 	    ".fhi-key    { font-family: monospace; padding: 0 6px; border-radius: 4px;"
 	    "              border: 1px solid alpha(currentColor, 0.35);"
@@ -994,6 +1008,16 @@ apply_all(State *st, gboolean save)
 	} else {
 		vte_terminal_set_default_colors(term);
 	}
+
+	/* terminal font: the user's own choice if there is one, else plain Monospace.
+	 * Either way the bundled Nerd Font is the last family, so icons in prompts
+	 * (starship, powerlevel10k, eza, ...) show even without a patched font. */
+	PangoFontDescription *fd = pango_font_description_from_string(c->term_font ? c->term_font : "Monospace 10");
+	char *families = g_strdup_printf("%s, " FHI_ICON_FONT, pango_font_description_get_family(fd));
+	pango_font_description_set_family(fd, families);
+	vte_terminal_set_font(term, fd);
+	pango_font_description_free(fd);
+	g_free(families);
 
 	gtk_filter_changed(st->hidden_filter, GTK_FILTER_CHANGE_DIFFERENT);
 	if (st->sorter) gtk_sorter_changed(st->sorter, GTK_SORTER_CHANGE_DIFFERENT);
@@ -1133,6 +1157,30 @@ on_scheme_changed(GObject *dd, GParamSpec *pspec, gpointer user_data)
 	apply_all(st, TRUE);
 }
 
+static gboolean
+only_monospace(const PangoFontFamily *family, const PangoFontFace *face, gpointer data)
+{
+	return pango_font_family_is_monospace((PangoFontFamily *)family);
+}
+
+static void
+on_term_font_set(GtkFontButton *button, gpointer user_data)
+{
+	State *st = user_data;
+	g_free(st->cfg.term_font);
+	st->cfg.term_font = g_strdup(gtk_font_chooser_get_font(GTK_FONT_CHOOSER(button)));
+	apply_all(st, TRUE);
+}
+
+static void
+on_term_font_default(GtkButton *button, gpointer user_data)
+{
+	State *st = user_data;
+	g_clear_pointer(&st->cfg.term_font, g_free);
+	gtk_font_chooser_set_font(GTK_FONT_CHOOSER(st->font_btn), "Monospace 10");
+	apply_all(st, TRUE);
+}
+
 static void
 on_reset_theme(GtkButton *button, gpointer user_data)
 {
@@ -1147,7 +1195,7 @@ on_reset_theme(GtkButton *button, gpointer user_data)
 	for (int i = 0; i < C_COUNT; i++) st->cfg.col[i] = fresh.col[i];   /* set_rgba is silent */
 	st->cfg.scheme = fresh.scheme;
 	st->cfg.custom_term = fresh.custom_term;
-	apply_all(st, TRUE);
+	on_term_font_default(NULL, st);
 }
 
 static GtkWidget *
@@ -1182,6 +1230,25 @@ build_theme_page(State *st, GtkWidget *stack)
 	gtk_box_append(GTK_BOX(page), sw_row);
 	gtk_box_append(GTK_BOX(page), color_row(st, C_TERM_BG));
 	gtk_box_append(GTK_BOX(page), color_row(st, C_TERM_FG));
+
+	GtkWidget *fl = gtk_label_new("Terminal font");
+	gtk_label_set_xalign(GTK_LABEL(fl), 0);
+	gtk_widget_add_css_class(fl, "dim-label");
+	gtk_box_append(GTK_BOX(page), fl);
+	GtkWidget *frow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+	st->font_btn = gtk_font_button_new_with_font(st->cfg.term_font ? st->cfg.term_font : "Monospace 10");
+	gtk_font_chooser_set_filter_func(GTK_FONT_CHOOSER(st->font_btn), only_monospace, NULL, NULL);
+	gtk_widget_set_hexpand(st->font_btn, TRUE);
+	g_signal_connect(st->font_btn, "font-set", G_CALLBACK(on_term_font_set), st);
+	GtkWidget *fdef = gtk_button_new_with_label("Default");
+	g_signal_connect(fdef, "clicked", G_CALLBACK(on_term_font_default), st);
+	gtk_box_append(GTK_BOX(frow), st->font_btn);
+	gtk_box_append(GTK_BOX(frow), fdef);
+	gtk_box_append(GTK_BOX(page), frow);
+	GtkWidget *fh = gtk_label_new("Nerd Font icons always work as a fallback.");
+	gtk_label_set_xalign(GTK_LABEL(fh), 0);
+	gtk_widget_add_css_class(fh, "dim-label");
+	gtk_box_append(GTK_BOX(page), fh);
 
 	GtkWidget *reset = gtk_button_new_with_label("Reset to defaults");
 	g_signal_connect(reset, "clicked", G_CALLBACK(on_reset_theme), st);
@@ -1691,6 +1758,7 @@ activate(GtkApplication *app, gpointer user_data)
 int
 main(int argc, char *argv[])
 {
+	fhi_icon_font_register(FHI_FONT_DIR "/SymbolsNerdFont-Regular.ttf");
 	GtkApplication *app = gtk_application_new("dev.forcedev.myterm", G_APPLICATION_NON_UNIQUE);
 	/* NON_UNIQUE: every launch is its own process. With the default, starting FHI
 	 * while another one runs only opens a window inside the OLD process, so a

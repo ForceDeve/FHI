@@ -10,6 +10,9 @@ if [[ -r "$FHI_USER_ZDOTDIR/.zshrc" ]]; then
   ZDOTDIR="$FHI_ZDOTDIR"
 fi
 
+# Step 1b: a nicer prompt, but only if the user has not set one up themselves.
+source "$FHI_ZDOTDIR/fhi-prompt.zsh"
+
 # Step 2: our hook. We do this AFTER the user's file on purpose, so nothing
 # they configured can remove or override it.
 #
