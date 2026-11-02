@@ -1328,7 +1328,7 @@ on_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode,
 
 /* ======================================================================== */
 /* Hamburger menu: settings, theme, cheat sheet, file info                    */
-/* ======================================================================== */
+/* ======================================================================== */,
 
 static void
 settings_defaults(Settings *c)
