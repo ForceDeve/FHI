@@ -87,6 +87,9 @@ typedef struct {
 	GtkWidget *menu_layer;           /* the menu panel + click-away area, over the window */
 	GtkWidget *menu_stack;
 	GtkWidget *menu_first;           /* first button of the main page, gets focus on open */
+	GtkWidget *left_panel;           /* the file list side: dimmed when an unsupported shell runs */
+	GtkWidget *unsupported_label;    /* "bash is not supported", over the panel */
+	char *unsupported_shell;         /* name of that shell, NULL while all is fine */
 	GtkWidget *last_pane;            /* list or terminal: where focus goes after the menu closes */
 	GtkWidget *font_btn;             /* terminal font chooser */
 	GtkWidget *scheme_dd;            /* theme page widgets, kept so "Reset" can update them */
@@ -613,12 +616,40 @@ on_cwd_changed(VteTerminal *terminal, gpointer user_data)
  * prompt it is the foreground program, and its process group id equals its
  * PID. While vim runs, the foreground group is vim's, so the numbers differ.
  */
+/* Name of the program in front of the terminal (new string, free it), NULL if unknown */
+static char *
+foreground_comm(State *st)
+{
+	VtePty *pty = vte_terminal_get_pty(VTE_TERMINAL(st->terminal));
+	if (pty == NULL || st->shell_pid <= 0) return NULL;
+	pid_t pgid = tcgetpgrp(vte_pty_get_fd(pty));
+	if (pgid <= 0) return NULL;
+	/* The leader of the foreground process group is the program itself; its name is in /proc */
+	char *file = g_strdup_printf("/proc/%d/comm", (int)pgid);
+	char *comm = NULL;
+	g_file_get_contents(file, &comm, NULL, NULL);
+	g_free(file);
+	if (comm) g_strstrip(comm);
+	return comm;
+}
+
+/* Other shells: FHI only understands zsh (its hooks live in zsh/.zshrc) */
+static gboolean
+is_unsupported_shell(const char *comm)
+{
+	static const char *const shells[] = { "bash", "sh", "dash", "fish", "ksh", "csh", "tcsh" };
+	for (guint i = 0; i < G_N_ELEMENTS(shells); i++)
+		if (strcmp(comm, shells[i]) == 0) return TRUE;
+	return FALSE;
+}
+
 static gboolean
 shell_is_foreground(State *st)
 {
 	VtePty *pty = vte_terminal_get_pty(VTE_TERMINAL(st->terminal));
 	if (pty == NULL || st->shell_pid <= 0) return FALSE;
-	return tcgetpgrp(vte_pty_get_fd(pty)) == st->shell_pid;
+	if (tcgetpgrp(vte_pty_get_fd(pty)) != st->shell_pid) return FALSE;
+	return st->unsupported_shell == NULL;   /* `exec bash` keeps the pid, so look at the name too */
 }
 
 /* Send text to the shell exactly as if the user had typed it. */
@@ -883,28 +914,121 @@ on_row_activated(GtkListView *view, guint position, gpointer user_data)
 	g_object_unref(info);
 }
 
-/* Shift+Enter: type the highlighted file's path at the end of the command line. */
+/* Who is in front of the terminal right now? */
+typedef enum { FG_OTHER, FG_SHELL, FG_VIM, FG_NANO, FG_PYTHON } Foreground;
+
+static Foreground
+foreground_kind(State *st)
+{
+	VtePty *pty = vte_terminal_get_pty(VTE_TERMINAL(st->terminal));
+	if (pty == NULL || st->shell_pid <= 0) return FG_OTHER;
+	pid_t pgid = tcgetpgrp(vte_pty_get_fd(pty));
+	if (pgid == st->shell_pid) return st->unsupported_shell ? FG_OTHER : FG_SHELL;
+	if (pgid <= 0) return FG_OTHER;
+
+	char *comm = foreground_comm(st);
+	if (comm == NULL) return FG_OTHER;
+
+	Foreground kind = FG_OTHER;
+	static const char *const vims[] = { "vim", "nvim", "vi", "view", "gvim", "vimx", "nvi", "ex" };
+	for (guint i = 0; i < G_N_ELEMENTS(vims); i++)
+		if (g_str_has_prefix(comm, vims[i]) && (comm[strlen(vims[i])] == '\0' || comm[strlen(vims[i])] == '.'))
+			kind = FG_VIM;   /* also vim.basic, vim.tiny */
+	if (strcmp(comm, "nano") == 0 || strcmp(comm, "rnano") == 0) kind = FG_NANO;
+	if (g_str_has_prefix(comm, "python") || g_str_has_prefix(comm, "ipython") ||
+	    g_str_has_prefix(comm, "bpython") || g_str_has_prefix(comm, "ptpython"))
+		kind = FG_PYTHON;
+	g_free(comm);
+	return kind;
+}
+
+/* `path` as a Python string literal: 'it\'s a file.txt' */
+static char *
+python_literal(const char *path)
+{
+	GString *out = g_string_new("'");
+	for (const char *c = path; *c; c++) {
+		unsigned char ch = (unsigned char)*c;
+		if (ch == '\\' || ch == '\'') g_string_append_c(out, '\\'), g_string_append_c(out, ch);
+		else if (ch == '\n') g_string_append(out, "\\n");
+		else if (ch == '\r') g_string_append(out, "\\r");
+		else if (ch == '\t') g_string_append(out, "\\t");
+		else if (ch < 0x20 || ch == 0x7f) g_string_append_printf(out, "\\x%02x", ch);
+		else g_string_append_c(out, ch);   /* UTF-8 bytes pass through unchanged */
+	}
+	g_string_append_c(out, '\'');
+	return g_string_free(out, FALSE);
+}
+
+/*
+ * Shift+Enter: put the highlighted file's path where the program in the terminal wants it.
+ *   shell   -> quoted for the shell, with a space after it, typed as keys
+ *   vim     -> the plain path, pasted (bracketed paste: lands in the text in any mode)
+ *   nano    -> the plain path, pasted
+ *   python  -> a quoted string literal 'path', pasted
+ * Any other program in front: do nothing, we would only type garbage into it.
+ */
 static void
 paste_selected_path(State *st)
 {
-	if (!shell_is_foreground(st)) return;
+	Foreground fg = foreground_kind(st);
+	if (fg == FG_OTHER) return;
 
 	/* "selected item" is owned by the selection model: do not unref it */
 	GFileInfo *info = gtk_single_selection_get_selected_item(st->selection);
 	if (info == NULL) return;
 	GFile *file = G_FILE(g_file_info_get_attribute_object(info, "standard::file"));
 	if (file == NULL) return;
-
 	char *path = g_file_get_path(file);
-	char *quoted = g_shell_quote(path);
-	char *text = g_strdup_printf(" %s ", quoted); /* trailing space for the next word */
-	type_into_terminal(st, text);
-	g_free(text);
-	g_free(quoted);
+	if (path == NULL) return;
+
+	if (fg == FG_SHELL) {
+		char *quoted = g_shell_quote(path);
+		char *text = g_strdup_printf(" %s ", quoted); /* trailing space for the next word */
+		type_into_terminal(st, text);
+		g_free(text);
+		g_free(quoted);
+	} else if (fg == FG_PYTHON) {
+		char *lit = python_literal(path);
+		vte_terminal_paste_text(VTE_TERMINAL(st->terminal), lit);
+		g_free(lit);
+	} else {
+		vte_terminal_paste_text(VTE_TERMINAL(st->terminal), path);
+	}
 	g_free(path);
 
-	/* The user will want to keep typing the command, so go back to the terminal */
+	/* The user will want to keep typing, so go back to the terminal */
 	gtk_widget_grab_focus(st->terminal);
+}
+
+
+/*
+ * Every half second: is a shell other than zsh running in the terminal? Nothing tells
+ * us when the foreground program changes, so we look. Then the file list is dimmed
+ * and says so, because its preview and cd features would not work.
+ */
+static gboolean
+check_shell_support(gpointer user_data)
+{
+	State *st = user_data;
+	char *comm = foreground_comm(st);
+	const char *bad = (comm && is_unsupported_shell(comm)) ? comm : NULL;
+
+	if (g_strcmp0(bad, st->unsupported_shell) != 0) {
+		g_free(st->unsupported_shell);
+		st->unsupported_shell = g_strdup(bad);
+		if (bad) {
+			char *text = g_strdup_printf("%s is not supported", bad);
+			gtk_label_set_text(GTK_LABEL(st->unsupported_label), text);
+			g_free(text);
+		}
+		gtk_widget_set_sensitive(st->left_panel, bad == NULL);
+		if (bad) gtk_widget_add_css_class(st->left_panel, "fhi-dim");
+		else gtk_widget_remove_css_class(st->left_panel, "fhi-dim");
+		gtk_widget_set_visible(st->unsupported_label, bad != NULL);
+	}
+	g_free(comm);
+	return G_SOURCE_CONTINUE;
 }
 
 static void menu_set_open(State *st, gboolean open);
@@ -1343,6 +1467,8 @@ apply_all(State *st, gboolean save)
 	    "              border-right: 1px solid alpha(currentColor, 0.25);"
 	    "              box-shadow: 4px 0 14px alpha(black, 0.35); }"
 	    ".fhi-top    { padding: 4px; }"
+	    ".fhi-unsupported { background: alpha(@theme_bg_color, 0.95); font-weight: bold; padding: 8px 12px; border-radius: 6px; }"
+	    ".fhi-dim    { opacity: 0.35; }"
 	    ".fhi-square, .fhi-square > border, .fhi-square scrolledwindow { border-radius: 0; }"
 	    ".fhi-sort   { font-size: 8pt; opacity: 0.5; padding: 4px 8px; }"
 	    ".fhi-swatch { min-width: 14px; min-height: 14px; border-radius: 3px; }",
@@ -1637,7 +1763,7 @@ build_cheat_page(State *st, GtkWidget *stack)
 		{ "Enter", "Open the file, or cd into the folder; your typed command is kept (file list)" },
 		{ "→ / ←", "Open / close the highlighted folder in place (file list)" },
 		{ "Backspace", "Go up one folder (cd ..) (file list)" },
-		{ "Shift + Enter", "Type the file's path onto the command line (file list)" },
+		{ "Shift + Enter", "Paste the file's path into the terminal: quoted for the shell, plain in vim / nano, a string in python (file list)" },
 		{ "Double click", "Same as Enter" },
 		{ "Shift + ↑ / ↓", "Next / previous sort mode (file list)" },
 		{ "Ctrl + R", "Reverse the sort order (file list)" },
@@ -2103,9 +2229,21 @@ activate(GtkApplication *app, gpointer user_data)
 	gtk_overlay_set_child(GTK_OVERLAY(overlay), pane);
 	gtk_overlay_add_overlay(GTK_OVERLAY(overlay), build_menu_layer(st));
 	gtk_window_set_child(GTK_WINDOW(window), overlay);
+	/* The panel sits in an overlay so a message can float over it when it is dimmed */
+	st->left_panel = left;
+	st->unsupported_label = gtk_label_new(NULL);
+	gtk_widget_add_css_class(st->unsupported_label, "fhi-unsupported");
+	gtk_widget_set_halign(st->unsupported_label, GTK_ALIGN_CENTER);
+	gtk_widget_set_valign(st->unsupported_label, GTK_ALIGN_CENTER);
+	gtk_widget_set_can_target(st->unsupported_label, FALSE);
+	gtk_widget_set_visible(st->unsupported_label, FALSE);
+	GtkWidget *left_overlay = gtk_overlay_new();
+	gtk_overlay_set_child(GTK_OVERLAY(left_overlay), left);
+	gtk_overlay_add_overlay(GTK_OVERLAY(left_overlay), st->unsupported_label);
+	g_timeout_add(500, check_shell_support, st);
 	gtk_widget_add_css_class(frame1, "fhi-square");   /* no rounded corners on the two panels */
 	gtk_widget_add_css_class(frame2, "fhi-square");
-	gtk_frame_set_child(GTK_FRAME(frame1), left);
+	gtk_frame_set_child(GTK_FRAME(frame1), left_overlay);
 	gtk_frame_set_child(GTK_FRAME(frame2), terminal);
 	apply_all(st, FALSE);
 	gtk_window_present(GTK_WINDOW(window));

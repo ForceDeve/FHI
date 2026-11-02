@@ -15,7 +15,7 @@ press Enter.
   and `git push` the files in the commits it would send. Needs `git`; a change inside a subfolder
   lights up that folder.
 - **Keyboard-driven list** – `Shift+←/→` switch between list and terminal, `Enter` opens a file or
-  `cd`s into a folder, `Shift+Enter` types the path onto your command line, `Backspace` is `cd ..`.
+  `cd`s into a folder, `Shift+Enter` pastes the path into whatever runs in the terminal (shell-quoted at the prompt, plain text in vim/nano, a quoted string in python), `Backspace` is `cd ..`.
 - **Folder peeking** – `→` opens the highlighted folder inside the list (indented, nesting works,
   no `cd`); `←` closes it, or jumps from an entry back to its folder. `Enter` still `cd`s, and keeps
   whatever you were typing on the command line.

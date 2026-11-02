@@ -2,13 +2,14 @@ FHI - build and install from source
 ===================================
 
 Needs: a C compiler, cmake (3.21+), ninja or make, pkg-config, and the
-development files for GTK 4 and VTE built for GTK 4. At run time it also needs zsh.
+development files for GTK 4, VTE built for GTK 4, pango and fontconfig. At run time it
+also needs zsh (and git, optionally, for the git commit / push preview).
 
   Debian / Ubuntu : sudo apt install build-essential cmake ninja-build pkg-config \
-                         libgtk-4-dev libvte-2.91-gtk4-dev zsh
+                         libgtk-4-dev libvte-2.91-gtk4-dev libfontconfig-dev zsh git
   Fedora          : sudo dnf install gcc cmake ninja-build pkgconf-pkg-config \
-                         gtk4-devel vte291-gtk4-devel zsh
-  Arch            : sudo pacman -S base-devel cmake ninja gtk4 vte4 zsh
+                         gtk4-devel vte291-gtk4-devel fontconfig-devel zsh git
+  Arch            : sudo pacman -S base-devel cmake ninja gtk4 vte4 fontconfig zsh git
 
 Build and install (default prefix /usr/local):
 
@@ -18,3 +19,6 @@ Build and install (default prefix /usr/local):
 
 For another prefix add -DCMAKE_INSTALL_PREFIX=/usr to the first command.
 Then start it with:  FHI
+
+Arch: packaging/PKGBUILD builds a proper package from the source tarball
+(put fhi-<version>.tar.gz next to it, then run: makepkg -si).

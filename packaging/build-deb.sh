@@ -14,6 +14,10 @@ cmake -S "$ROOT" -B "$WORK/build" -G Ninja -DFHI_PACKAGE=ON \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
 cmake --build "$WORK/build"
 DESTDIR="$WORK/pkg" cmake --install "$WORK/build" --strip
+# the program must not look for libraries in the build machine's home folder
+if readelf -d "$WORK/pkg/usr/bin/FHI" | grep -q -E 'RPATH|RUNPATH'; then
+  echo "error: binary still has an RPATH/RUNPATH" >&2; exit 1
+fi
 
 mkdir -p "$WORK/pkg/DEBIAN"
 cat > "$WORK/pkg/DEBIAN/control" <<CONTROL
@@ -22,12 +26,14 @@ Version: $VERSION
 Section: utils
 Priority: optional
 Architecture: $ARCH
-Depends: zsh, libgtk-4-1 (>= 4.8), libvte-2.91-gtk4-0, libglib2.0-0
+Depends: zsh, libgtk-4-1 (>= 4.8), libvte-2.91-gtk4-0 (>= 0.70), libglib2.0-0, libpango-1.0-0, libfontconfig1
+Recommends: git
 Maintainer: $MAINTAINER
 Description: Terminal with a file list that previews what your command will do
  FHI is a GTK4 terminal that always runs zsh. Next to the terminal it shows
  the current folder and highlights the files the command you are typing
- would touch, create or delete.
+ would touch, create or delete. Shows file-type icons, can peek into folders
+ and previews what git commit and git push will include (needs git).
 CONTROL
 
 # the .deb must not be owned by the build user

@@ -11,6 +11,7 @@
 # Packages from packaging/build-*.sh
 *.deb
 *.tar.gz
+*.pkg.tar.zst
 
 # Local tool config: the CLion MCP port changes every session
 /.mcp.json
