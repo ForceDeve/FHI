@@ -42,6 +42,21 @@ GPtrArray *fhi_preview_parse(const char *buffer, const char *cwd,
                              const char *const *existing);
 
 /*
+ * What the typed line says about git. `git commit` and `git push` do not name the
+ * files they affect, so the caller has to ask git (see gitinfo.c).
+ */
+typedef struct {
+	gboolean commit;      /* a `git commit` is being typed                           */
+	gboolean commit_all;  /* ... with -a / --all (also commits unstaged changes)     */
+	gboolean has_paths;   /* ... with file names (`git commit a.c`): those are used  */
+	gboolean push;        /* a `git push` is being typed                             */
+} FhiGitAction;
+
+/* Same as fhi_preview_parse(), and additionally reports the git action (git may be NULL) */
+GPtrArray *fhi_preview_parse_ex(const char *buffer, const char *cwd,
+                                const char *const *existing, FhiGitAction *git);
+
+/*
  * A file-list filter typed like shell words:
  *   *.png   report?   [a-c]*   file{1,2}.txt   "two words"   !*.o
  * Several words match if ANY of them does; a word starting with ! excludes.

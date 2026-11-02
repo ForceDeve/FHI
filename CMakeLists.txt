@@ -27,7 +27,7 @@ else()
 	set(FHI_DATA_DIR "${CMAKE_SOURCE_DIR}")
 endif()
 
-add_executable(FHI main.c preview.c filetype.c)
+add_executable(FHI main.c preview.c filetype.c gitinfo.c)
 target_link_libraries(FHI PRIVATE PkgConfig::GTK4 PkgConfig::VTE PkgConfig::FONTCONFIG)
 
 # Folders with the zsh startup files (the program tells zsh to read them via ZDOTDIR)

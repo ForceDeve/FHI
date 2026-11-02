@@ -11,6 +11,9 @@ press Enter.
 - **Command preview** – files light up by what the command would do: mentioned (yellow), created
   (green), `mv`/`cp`/`ln` destination (blue), deleted (red). Understands globs, `{a,b}` braces,
   quoting, `sudo`, redirections and pipes. Files a command would create appear as faint ghost rows.
+  `git commit` lights up the files it would commit (staged ones, or all tracked changes with `-a`)
+  and `git push` the files in the commits it would send. Needs `git`; a change inside a subfolder
+  lights up that folder.
 - **Keyboard-driven list** – `Shift+←/→` switch between list and terminal, `Enter` opens a file or
   `cd`s into a folder, `Shift+Enter` types the path onto your command line, `Backspace` is `cd ..`.
 - **Folder peeking** – `→` opens the highlighted folder inside the list (indented, nesting works,

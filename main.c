@@ -12,6 +12,7 @@
 #include <glib/gstdio.h>
 #include "preview.h"
 #include "filetype.h"
+#include "gitinfo.h"
 #include <strings.h>
 
 /* Indexes into Settings.col */
@@ -369,6 +370,26 @@ make_ghost(GFile *dir, const char *name)
 	return info;
 }
 
+/* Mark the files of `files` (takes the reference) with `role` in the preview result */
+static void
+add_git_hits(GPtrArray *hits, GPtrArray *files, FhiRole role)
+{
+	for (guint i = 0; i < files->len; i++) {
+		const char *name = files->pdata[i];
+		FhiHit *hit = NULL;
+		for (guint k = 0; k < hits->len && !hit; k++)
+			if (strcmp(((FhiHit *)hits->pdata[k])->name, name) == 0) hit = hits->pdata[k];
+		if (hit == NULL) {
+			hit = g_new0(FhiHit, 1);
+			hit->name = g_strdup(name);
+			hit->exists = TRUE;
+			g_ptr_array_add(hits, hit);
+		}
+		if (role > hit->role) hit->role = role;
+	}
+	g_ptr_array_unref(files);
+}
+
 /*
  * Re-read the command line `buffer`, work out which files it affects (see
  * preview.c) and update the file list: color the real rows and add "ghost"
@@ -398,7 +419,14 @@ update_preview(State *st, const char *buffer)
 	}
 	g_ptr_array_add(names, NULL);
 
-	GPtrArray *hits = fhi_preview_parse(copy, cwd, (const char *const *)names->pdata);
+	FhiGitAction git;
+	GPtrArray *hits = fhi_preview_parse_ex(copy, cwd, (const char *const *)names->pdata, &git);
+
+	/* `git commit` / `git push` do not name their files: ask git (see gitinfo.c) */
+	if (git.commit && !git.has_paths)
+		add_git_hits(hits, fhi_git_files(cwd, git.commit_all ? FHI_GIT_TRACKED : FHI_GIT_STAGED), FHI_ROLE_CREATE);
+	if (git.push)
+		add_git_hits(hits, fhi_git_files(cwd, FHI_GIT_UNPUSHED), FHI_ROLE_DEST);
 
 	g_hash_table_remove_all(st->roles);
 	GString *key = g_string_new(NULL);
@@ -497,6 +525,7 @@ on_title_changed(VteTerminal *terminal, gpointer user_data)
 	 * prompt is back. Wait a moment, so GTK can finish its own file watching
 	 * first, then check that the list is right. */
 	if (g_str_has_prefix(title, "FHI-PROMPT:")) {
+		fhi_git_invalidate();   /* the command may have staged, committed or pushed something */
 		if (st->resync_timer == 0) st->resync_timer = g_timeout_add(300, resync_directory, st);
 		return;
 	}

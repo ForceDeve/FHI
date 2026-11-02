@@ -356,6 +356,7 @@ typedef struct {
 	const char *cwd;
 	GHashTable *existing;  /* set of names present in cwd */
 	GHashTable *hits;      /* name -> FhiHit* */
+	FhiGitAction *git;     /* filled in when the line contains git commit / push (may be NULL) */
 } Ctx;
 
 static void
@@ -521,6 +522,79 @@ is_option(const Token *t)
 	return t->pattern[0] == '-' && t->pattern[1] != '\0';
 }
 
+
+/* ---- git ---------------------------------------------------------------- */
+
+/* Which short options of `git commit` take a value (-m "text", -F file, ...) */
+static gboolean
+commit_short_takes_arg(char c)
+{
+	return strchr("mFCct", c) != NULL;
+}
+
+static gboolean
+commit_long_takes_arg(const char *o)
+{
+	static const char *const list[] = {
+		"--message", "--file", "--reuse-message", "--reedit-message", "--template", "--author",
+		"--date", "--cleanup", "--fixup", "--squash", "--trailer", "--pathspec-from-file",
+	};
+	for (guint i = 0; i < G_N_ELEMENTS(list); i++)
+		if (strcmp(o, list[i]) == 0) return TRUE;
+	return FALSE;
+}
+
+/*
+ * `words[from..]` are the arguments after the word "git". Skip git's own options,
+ * find the sub-command, and note what a commit / push is about to do.
+ */
+static void
+git_scan(Ctx *ctx, GPtrArray *words, guint from)
+{
+	if (ctx->git == NULL) return;
+	guint i = from;
+	/* git -c key=val  --no-pager ... subcommand */
+	for (; i < words->len; i++) {
+		const Token *t = words->pdata[i];
+		if (!is_option(t)) break;
+		if (strcmp(t->pattern, "-C") == 0 || strcmp(t->pattern, "--git-dir") == 0 ||
+		    strcmp(t->pattern, "--work-tree") == 0)
+			return;   /* works on another directory: we can't tell */
+		if (strcmp(t->pattern, "-c") == 0) i++;
+	}
+	if (i >= words->len) return;
+	const Token *sub = words->pdata[i++];
+	if (sub->unknown) return;
+
+	if (strcmp(sub->pattern, "push") == 0) {
+		ctx->git->push = TRUE;
+	} else if (strcmp(sub->pattern, "commit") == 0) {
+		ctx->git->commit = TRUE;
+		gboolean options_done = FALSE;
+		for (; i < words->len; i++) {
+			const Token *t = words->pdata[i];
+			const char *o = t->pattern;
+			if (!options_done && strcmp(o, "--") == 0) { options_done = TRUE; continue; }
+			if (!options_done && o[0] == '-' && o[1] != '\0') {
+				if (o[1] == '-') {
+					if (strcmp(o, "--all") == 0) ctx->git->commit_all = TRUE;
+					else if (commit_long_takes_arg(o)) i++;
+				} else {
+					for (const char *c = o + 1; *c; c++) {
+						if (*c == 'a') ctx->git->commit_all = TRUE;
+						if (commit_short_takes_arg(*c)) {
+							if (c[1] == '\0') i++;   /* the value is the next word */
+							break;                   /* else it is attached: -m"text" */
+						}
+					}
+				}
+				continue;
+			}
+			ctx->git->has_paths = TRUE;
+		}
+	}
+}
+
 /* `words` holds the Token*s of ONE simple command, redirections excluded. */
 static void
 analyze(Ctx *ctx, GPtrArray *words)
@@ -546,7 +620,9 @@ analyze(Ctx *ctx, GPtrArray *words)
 		break;
 	}
 	if (!cmd) return;
-	Kind kind = ((const Token *)words->pdata[i])->unknown ? KIND_GENERIC : classify(cmd);
+	gboolean unknown_cmd = ((const Token *)words->pdata[i])->unknown;
+	Kind kind = unknown_cmd ? KIND_GENERIC : classify(cmd);
+	if (!unknown_cmd && strcmp(cmd, "git") == 0) git_scan(ctx, words, i + 1);
 	g_free(cmd);
 	i++;
 
@@ -604,7 +680,16 @@ compare_hits(gconstpointer a, gconstpointer b)
 GPtrArray *
 fhi_preview_parse(const char *buffer, const char *cwd, const char *const *existing)
 {
+	return fhi_preview_parse_ex(buffer, cwd, existing, NULL);
+}
+
+GPtrArray *
+fhi_preview_parse_ex(const char *buffer, const char *cwd, const char *const *existing,
+                     FhiGitAction *git)
+{
 	Ctx ctx;
+	if (git) memset(git, 0, sizeof *git);
+	ctx.git = git;
 	ctx.cwd = cwd;
 	ctx.existing = g_hash_table_new(g_str_hash, g_str_equal);
 	for (; existing && *existing; existing++) g_hash_table_add(ctx.existing, (gpointer)*existing);
