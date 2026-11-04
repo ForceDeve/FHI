@@ -8,6 +8,7 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/ForceDeve"
 license=('custom:FHI')
 depends=('gtk4' 'vte4' 'zsh' 'fontconfig' 'pango' 'glib2')
+options=('!debug')
 makedepends=('cmake' 'ninja')
 optdepends=('git: preview of what git commit / git push will include')
 source=("$pkgname-$pkgver.tar.gz")

@@ -12,7 +12,7 @@ mkdir "$WORK/fhi-$VERSION"
 cd "$ROOT"
 cp -r CMakeLists.txt LICENSE README.md CHANGELOG.md main.c preview.c preview.h filetype.c filetype.h gitinfo.c gitinfo.h sshinfo.c sshinfo.h llmcli.c llmcli.h tmuxinfo.c tmuxinfo.h theme.c theme.h zsh icons fonts themes "$WORK/fhi-$VERSION/"
 mkdir "$WORK/fhi-$VERSION/packaging"
-cp packaging/VERSION packaging/dev.forcedev.myterm.desktop packaging/PKGBUILD packaging/INSTALL.txt "$WORK/fhi-$VERSION/packaging/"
+cp packaging/VERSION packaging/dev.forcedev.myterm.desktop packaging/PKGBUILD packaging/fhi.spec packaging/INSTALL.txt "$WORK/fhi-$VERSION/packaging/"
 cp packaging/INSTALL.txt "$WORK/fhi-$VERSION/"
 
 # self-test: build + install from the copy
